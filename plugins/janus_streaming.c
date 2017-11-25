@@ -182,6 +182,8 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 void janus_streaming_setup_media(janus_plugin_session *handle);
 void janus_streaming_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len);
 void janus_streaming_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len);
+void janus_textroom_incoming_data(janus_plugin_session *handle, char *buf, int len);
+void janus_textroom_slow_link(janus_plugin_session *handle, int uplink, int video);
 void janus_streaming_hangup_media(janus_plugin_session *handle);
 void janus_streaming_destroy_session(janus_plugin_session *handle, int *error);
 json_t *janus_streaming_query_session(janus_plugin_session *handle);
@@ -206,6 +208,8 @@ static janus_plugin janus_streaming_plugin =
 		.setup_media = janus_streaming_setup_media,
 		.incoming_rtp = janus_streaming_incoming_rtp,
 		.incoming_rtcp = janus_streaming_incoming_rtcp,
+		.incoming_data = janus_textroom_incoming_data,
+		.slow_link = janus_textroom_slow_link,
 		.hangup_media = janus_streaming_hangup_media,
 		.destroy_session = janus_streaming_destroy_session,
 		.query_session = janus_streaming_query_session,
@@ -2279,7 +2283,7 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 		response = json_object();
 		json_object_set_new(response, "streaming", json_string("ok"));
 		goto plugin_response;
-	} else if(!strcasecmp(request_text, "watch") || !strcasecmp(request_text, "start")
+	} else if(!strcasecmp(request_text, "connect") || !strcasecmp(request_text, "watch") || !strcasecmp(request_text, "start")
 			|| !strcasecmp(request_text, "pause") || !strcasecmp(request_text, "stop")
 			|| !strcasecmp(request_text, "configure") || !strcasecmp(request_text, "switch")) {
 		/* These messages are handled asynchronously */
@@ -2398,6 +2402,50 @@ void janus_streaming_incoming_rtcp(janus_plugin_session *handle, int video, char
 	/* FIXME Maybe we should care about RTCP, but not now */
 }
 
+void janus_textroom_incoming_data(janus_plugin_session *handle, char *buf, int len) {
+	if (handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
+		return;
+	/* Incoming request from this user: what should we do? */
+	janus_textroom_session *session = (janus_textroom_session *)handle->plugin_handle;
+	if (!session) {
+		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
+		return;
+	}
+	if (session->destroyed)
+		return;
+	if (buf == NULL || len <= 0)
+		return;
+	char *text = g_malloc0(len + 1);
+	memcpy(text, buf, len);
+	*(text + len) = '\0';
+	JANUS_LOG(LOG_VERB, "Got a DataChannel message (%zu bytes): %s\n", strlen(text), text);
+
+	//Send message to transport directly
+	json_t *event = json_object();
+	json_object_set_new(event, "streaming", json_string("message"));
+	json_object_set_new(event, "message", json_string(text));
+	gateway->push_event(session->handle, &janus_streaming_plugin, NULL, event, NULL);
+	json_decref(event);
+
+	//if (text[0] == '1')
+	//{
+	//	//This is a control message
+	//}
+	//else if (text[0] == '0')
+	//{
+	//	//This is ID
+	//}
+
+	//Command Types
+	//- Control: Send this to transport. There, send it to the car controlled by the driver.
+	//- ID : Takes this id and send it to transport. There see if this id matches with the one web server gave us. If so, set isValidaded to true. Otherwise hangup connection and remove the driver.
+}
+
+
+void janus_textroom_slow_link(janus_plugin_session *handle, int uplink, int video) {
+	//TODO: Let web server know
+}
+
 void janus_streaming_hangup_media(janus_plugin_session *handle) {
 	JANUS_LOG(LOG_INFO, "No WebRTC media anymore\n");
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
@@ -2482,16 +2530,108 @@ static void *janus_streaming_handler(void *data) {
 		const char *sdp_type = NULL;
 		char *sdp = NULL;
 		/* All these requests can only be handled asynchronously */
-		if(!strcasecmp(request_text, "watch")) {
+		if(!strcasecmp(request_text, "connect")) {		
+			
+			json_t *id = json_object_get(root, "id");
+			guint64 id_value = json_integer_value(id);
+			janus_mutex_lock(&mountpoints_mutex);
+			janus_streaming_mountpoint *mp = g_hash_table_lookup(mountpoints, &id_value);
+			if (mp == NULL) {
+				janus_mutex_unlock(&mountpoints_mutex);
+				JANUS_LOG(LOG_VERB, "No such mountpoint/stream %"SCNu64"\n", id_value);
+				error_code = JANUS_STREAMING_ERROR_NO_SUCH_MOUNTPOINT;
+				g_snprintf(error_cause, 512, "No such mountpoint/stream %"SCNu64"", id_value);
+				goto error;
+			}
+
+			/* Let's prepare an offer now, but let's also check if there0s something we need to skip */
+			sdp_type = "offer";	/* We're always going to do the offer ourselves, never answer */
+			char sdptemp[2048];
+			memset(sdptemp, 0, 2048);
+			gchar buffer[512];
+			memset(buffer, 0, 512);
+			gint64 sessid = janus_get_real_time();
+			gint64 version = sessid;	/* FIXME This needs to be increased when it changes, so time should be ok */
+			g_snprintf(buffer, 512,
+				"v=0\r\no=%s %"SCNu64" %"SCNu64" IN IP4 127.0.0.1\r\n",
+					"-", sessid, version);
+			g_strlcat(sdptemp, buffer, 2048);
+			g_snprintf(buffer, 512,
+				"s=Mountpoint %"SCNu64"\r\n", mp->id);
+			g_strlcat(sdptemp, buffer, 2048);
+			g_strlcat(sdptemp, "t=0 0\r\n", 2048);
+			
+
+			/* Add audio line */
+			g_snprintf(buffer, 512,
+				"m=audio 1 RTP/SAVPF %d\r\n"
+				"c=IN IP4 1.1.1.1\r\n",
+				mp->codecs.audio_pt);
+			g_strlcat(sdptemp, buffer, 2048);
+			if(mp->codecs.audio_rtpmap) {
+				g_snprintf(buffer, 512,
+					"a=rtpmap:%d %s\r\n",
+					mp->codecs.audio_pt, mp->codecs.audio_rtpmap);
+				g_strlcat(sdptemp, buffer, 2048);
+			}
+			if(mp->codecs.audio_fmtp) {
+				g_snprintf(buffer, 512,
+					"a=fmtp:%d %s\r\n",
+					mp->codecs.audio_pt, mp->codecs.audio_fmtp);
+				g_strlcat(sdptemp, buffer, 2048);
+			}
+			g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
+		
+			/* Add video line */
+			g_snprintf(buffer, 512,
+				"m=video 1 RTP/SAVPF %d\r\n"
+				"c=IN IP4 1.1.1.1\r\n",
+				mp->codecs.video_pt);
+			g_strlcat(sdptemp, buffer, 2048);
+			if(mp->codecs.video_rtpmap) {
+				g_snprintf(buffer, 512,
+					"a=rtpmap:%d %s\r\n",
+					mp->codecs.video_pt, mp->codecs.video_rtpmap);
+				g_strlcat(sdptemp, buffer, 2048);
+			}
+			if(mp->codecs.video_fmtp) {
+				g_snprintf(buffer, 512,
+					"a=fmtp:%d %s\r\n",
+					mp->codecs.video_pt, mp->codecs.video_fmtp);
+				g_strlcat(sdptemp, buffer, 2048);
+			}
+			g_snprintf(buffer, 512,
+				"a=rtcp-fb:%d nack\r\n",
+				mp->codecs.video_pt);
+			g_strlcat(sdptemp, buffer, 2048);
+			g_snprintf(buffer, 512,
+				"a=rtcp-fb:%d goog-remb\r\n",
+				mp->codecs.video_pt);
+			g_strlcat(sdptemp, buffer, 2048);
+			g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
+			
+#ifdef HAVE_SCTP
+			
+			/* Add data line */
+			g_snprintf(buffer, 512,
+				"m=application 1 DTLS/SCTP 5000\r\n"
+				"c=IN IP4 1.1.1.1\r\n"
+				"a=sctpmap:5000 webrtc-datachannel 16\r\n");
+			g_strlcat(sdptemp, buffer, 2048);
+			
+#endif
+			sdp = g_strdup(sdptemp);
+			JANUS_LOG(LOG_VERB, "Going to offer this SDP:\n%s\n", sdp);
+			result = json_object();
+			json_object_set_new(result, "status", json_string("preparing"));
+			
+		} else if(!strcasecmp(request_text, "watch")) {
 			JANUS_VALIDATE_JSON_OBJECT(root, watch_parameters,
 				error_code, error_cause, TRUE,
 				JANUS_STREAMING_ERROR_MISSING_ELEMENT, JANUS_STREAMING_ERROR_INVALID_ELEMENT);
 			if(error_code != 0)
 				goto error;
 			json_t *id = json_object_get(root, "id");
-			json_t *offer_audio = json_object_get(root, "offer_audio");
-			json_t *offer_video = json_object_get(root, "offer_video");
-			json_t *offer_data = json_object_get(root, "offer_data");
 			guint64 id_value = json_integer_value(id);
 			janus_mutex_lock(&mountpoints_mutex);
 			janus_streaming_mountpoint *mp = g_hash_table_lookup(mountpoints, &id_value);
@@ -2502,9 +2642,6 @@ static void *janus_streaming_handler(void *data) {
 				g_snprintf(error_cause, 512, "No such mountpoint/stream %"SCNu64"", id_value);
 				goto error;
 			}
-			/* A secret may be required for this action */
-			JANUS_CHECK_SECRET(mp->pin, root, "pin", error_code, error_cause,
-				JANUS_STREAMING_ERROR_MISSING_ELEMENT, JANUS_STREAMING_ERROR_INVALID_ELEMENT, JANUS_STREAMING_ERROR_UNAUTHORIZED);
 			if(error_code != 0) {
 				janus_mutex_unlock(&mountpoints_mutex);
 				goto error;
@@ -2514,35 +2651,11 @@ static void *janus_streaming_handler(void *data) {
 			session->stopping = FALSE;
 			session->mountpoint = mp;
 			/* Check what we should offer */
-			session->audio = offer_audio ? json_is_true(offer_audio) : TRUE;	/* True by default */
-			if(!mp->audio)
-				session->audio = FALSE;	/* ... unless the mountpoint isn't sending any audio */
-			session->video = offer_video ? json_is_true(offer_video) : TRUE;	/* True by default */
-			if(!mp->video)
-				session->video = FALSE;	/* ... unless the mountpoint isn't sending any video */
-			session->data = offer_data ? json_is_true(offer_data) : TRUE;	/* True by default */
-			if(!mp->data)
-				session->data = FALSE;	/* ... unless the mountpoint isn't sending any data */
-			if((!mp->audio || !session->audio) &&
-					(!mp->video || !session->video) &&
-					(!mp->data || !session->data)) {
-				JANUS_LOG(LOG_ERR, "Can't offer an SDP with no audio, video or data for this mountpoint\n");
-				error_code = JANUS_STREAMING_ERROR_INVALID_REQUEST;
-				g_snprintf(error_cause, 512, "Can't offer an SDP with no audio, video or data for this mountpoint");
-				goto error;
-			}
-			if(mp->streaming_type == janus_streaming_type_on_demand) {
-				GError *error = NULL;
-				char tname[16];
-				g_snprintf(tname, sizeof(tname), "mp %"SCNu64, id_value);
-				g_thread_try_new(tname, &janus_streaming_ondemand_thread, session, &error);
-				if(error != NULL) {
-					JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the on-demand thread...\n", error->code, error->message ? error->message : "??");
-					error_code = JANUS_STREAMING_ERROR_UNKNOWN_ERROR;
-					g_snprintf(error_cause, 512, "Got error %d (%s) trying to launch the on-demand thread", error->code, error->message ? error->message : "??");
-					goto error;
-				}
-			} else if(mp->streaming_source == janus_streaming_source_rtp) {
+			session->audio = TRUE;	/* True by default */
+			session->video = TRUE;	/* True by default */
+			session->data = TRUE;	/* True by default */
+
+			if(mp->streaming_source == janus_streaming_source_rtp) {
 				janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)mp->source;
 				if(source && source->simulcast) {
 					JANUS_VALIDATE_JSON_OBJECT(root, simulcast_parameters,
@@ -2571,86 +2684,7 @@ static void *janus_streaming_handler(void *data) {
 					}
 				}
 			}
-			/* Let's prepare an offer now, but let's also check if there0s something we need to skip */
-			sdp_type = "offer";	/* We're always going to do the offer ourselves, never answer */
-			char sdptemp[2048];
-			memset(sdptemp, 0, 2048);
-			gchar buffer[512];
-			memset(buffer, 0, 512);
-			gint64 sessid = janus_get_real_time();
-			gint64 version = sessid;	/* FIXME This needs to be increased when it changes, so time should be ok */
-			g_snprintf(buffer, 512,
-				"v=0\r\no=%s %"SCNu64" %"SCNu64" IN IP4 127.0.0.1\r\n",
-					"-", sessid, version);
-			g_strlcat(sdptemp, buffer, 2048);
-			g_snprintf(buffer, 512,
-				"s=Mountpoint %"SCNu64"\r\n", mp->id);
-			g_strlcat(sdptemp, buffer, 2048);
-			g_strlcat(sdptemp, "t=0 0\r\n", 2048);
-			if(mp->codecs.audio_pt >= 0 && session->audio) {
-				/* Add audio line */
-				g_snprintf(buffer, 512,
-					"m=audio 1 RTP/SAVPF %d\r\n"
-					"c=IN IP4 1.1.1.1\r\n",
-					mp->codecs.audio_pt);
-				g_strlcat(sdptemp, buffer, 2048);
-				if(mp->codecs.audio_rtpmap) {
-					g_snprintf(buffer, 512,
-						"a=rtpmap:%d %s\r\n",
-						mp->codecs.audio_pt, mp->codecs.audio_rtpmap);
-					g_strlcat(sdptemp, buffer, 2048);
-				}
-				if(mp->codecs.audio_fmtp) {
-					g_snprintf(buffer, 512,
-						"a=fmtp:%d %s\r\n",
-						mp->codecs.audio_pt, mp->codecs.audio_fmtp);
-					g_strlcat(sdptemp, buffer, 2048);
-				}
-				g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
-			}
-			if(mp->codecs.video_pt >= 0 && session->video) {
-				/* Add video line */
-				g_snprintf(buffer, 512,
-					"m=video 1 RTP/SAVPF %d\r\n"
-					"c=IN IP4 1.1.1.1\r\n",
-					mp->codecs.video_pt);
-				g_strlcat(sdptemp, buffer, 2048);
-				if(mp->codecs.video_rtpmap) {
-					g_snprintf(buffer, 512,
-						"a=rtpmap:%d %s\r\n",
-						mp->codecs.video_pt, mp->codecs.video_rtpmap);
-					g_strlcat(sdptemp, buffer, 2048);
-				}
-				if(mp->codecs.video_fmtp) {
-					g_snprintf(buffer, 512,
-						"a=fmtp:%d %s\r\n",
-						mp->codecs.video_pt, mp->codecs.video_fmtp);
-					g_strlcat(sdptemp, buffer, 2048);
-				}
-				g_snprintf(buffer, 512,
-					"a=rtcp-fb:%d nack\r\n",
-					mp->codecs.video_pt);
-				g_strlcat(sdptemp, buffer, 2048);
-				g_snprintf(buffer, 512,
-					"a=rtcp-fb:%d goog-remb\r\n",
-					mp->codecs.video_pt);
-				g_strlcat(sdptemp, buffer, 2048);
-				g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
-			}
-#ifdef HAVE_SCTP
-			if(mp->data && session->data) {
-				/* Add data line */
-				g_snprintf(buffer, 512,
-					"m=application 1 DTLS/SCTP 5000\r\n"
-					"c=IN IP4 1.1.1.1\r\n"
-					"a=sctpmap:5000 webrtc-datachannel 16\r\n");
-				g_strlcat(sdptemp, buffer, 2048);
-			}
-#endif
-			sdp = g_strdup(sdptemp);
-			JANUS_LOG(LOG_VERB, "Going to offer this SDP:\n%s\n", sdp);
-			result = json_object();
-			json_object_set_new(result, "status", json_string("preparing"));
+			
 			/* Add the user to the list of watchers and we're done */
 			janus_mutex_lock(&mp->mutex);
 			mp->listeners = g_list_append(mp->listeners, session);
