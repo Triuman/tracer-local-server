@@ -239,7 +239,7 @@ Then just use:
 to generate the configure file. After that, configure and compile as
 usual to start the whole compilation process:
 
-	./configure --prefix=/opt/janus
+	./configure --prefix=/opt/janus --disable-rabbitmq --disable-mqtt --disable-unix-sockets --disable-sample-event-handler --disable-rabbitmq-event-handler --disable-rest --disable-plugin-audiobridge --disable-plugin-echotest --disable-plugin-recordplay --disable-plugin-sip --disable-plugin-sipre --disable-plugin-nosip --disable-plugin-textroom --disable-plugin-videocall --disable-plugin-videoroom --disable-plugin-voicemail
 	make
 	make install
 
