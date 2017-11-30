@@ -2406,7 +2406,7 @@ void janus_textroom_incoming_data(janus_plugin_session *handle, char *buf, int l
 	if (handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* Incoming request from this user: what should we do? */
-	janus_textroom_session *session = (janus_textroom_session *)handle->plugin_handle;
+	janus_streaming_session *session = (janus_streaming_session *)handle->plugin_handle;
 	if (!session) {
 		JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 		return;

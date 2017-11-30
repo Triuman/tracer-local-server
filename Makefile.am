@@ -35,7 +35,7 @@ pluginsheaderdir = $(includedir)/janus/plugins
 pluginsheader_HEADERS = plugins/plugin.h
 
 transportsheaderdir = $(includedir)/janus/transports
-transportsheader_HEADERS = transports/transport.h
+transportsheader_HEADERS = transports/transport.h transports/dyad.h
 
 eventsheaderdir = $(includedir)/janus/events
 eventsheader_HEADERS = events/eventhandler.h
@@ -139,6 +139,8 @@ janus_SOURCES = \
 	plugins/plugin.c \
 	plugins/plugin.h \
 	transports/transport.h \
+	transports/dyad.c \
+	transports/dyad.h \
 	events/eventhandler.h \
 	$(NULL)
 
