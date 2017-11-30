@@ -1010,7 +1010,7 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
 	} else if (!strcasecmp(janus_text, "webrtcup"))
 	{
 		info = json_object();
-		json_object_set_new(info, "info", json_string("connected"));
+		json_object_set_new(info, "info", json_string("webrtcup"));
 		json_object_set_new(info, "driverid", json_string(driver->id));
 
 		goto send_info;
@@ -1358,7 +1358,26 @@ static int janus_websockets_common_callback(
 				//Prepare 'connect' command and send it to streaming plugin through gateway.
 				//{"janus":"message", "body" : {"request":"watch", "id" : 2}, "transaction" : "EtKVfSvaJYrU"}
 
-				
+				//Check if there is a driver with the given ID. If so, just send a webrtcup message to web server.
+				tracer_driver existingDriver = tracer_find_driver(driverId);
+				if (existingDriver != NULL)
+				{
+					json_t *info = json_object();
+					json_object_set_new(info, "info", json_string("webrtcup"));
+					json_object_set_new(info, "driverid", json_string(existingDriver->id));
+
+					//Send info to web server
+					/* Convert to string and enqueue */
+					char *payload = json_dumps(info, json_format);
+					g_async_queue_push(client->messages, payload);
+					lws_callback_on_writable(client->wsi);
+					janus_mutex_unlock(&client->mutex);
+					janus_mutex_unlock(&old_wss_mutex);
+					json_decref(info);
+					json_decref(message);
+					return 0;
+				}
+
 				struct tracer_driver *new_tracer_driver = g_malloc0(sizeof(tracer_driver));
 				janus_mutex_init(&new_tracer_driver->mutex);
 				new_tracer_driver->id = driverId;
@@ -1411,6 +1430,48 @@ static int janus_websockets_common_callback(
 
 				//Set driver's streamingCar to the selected car
 				driver->carStreamed = car;
+
+				goto send_message;
+			} else if (!strcasecmp(request_text, "startstreamandcontrol"))
+			{
+				//{janus: "message", body: {request: "watch", id: 1}, transaction: "d3pNxxpfMd3d"}
+
+				//Send watch message to plugin
+				message = json_object();
+				json_object_set_new(message, "janus", json_string("message"));
+				json_object_set_new(message, "opaque_id", json_string(driverId));
+				json_object_set_new(message, "transaction", json_string(driver->id));
+				json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+				json_object_set_new(message, "handle_id", json_integer(driver->handleId));
+				json_t *body = json_object();
+				json_object_set_new(body, "request", json_string("watch"));
+				json_object_set_new(body, "id", json_integer(car->streamId));
+				json_object_set_new(message, "body", body);
+
+				//Set driver's streamingCar to the selected car
+				driver->carStreamed = car;
+				//Set driver's contollingCar to selected car
+				driver->carControlled = car;
+
+				goto send_message;
+			} else if (!strcasecmp(request_text, "stopstreamandcontrol"))
+			{
+				//{janus: "message", body: {request: "watch", id: 1}, transaction: "d3pNxxpfMd3d"}
+
+				//Send stop message to the plugin
+				message = json_object();
+				json_object_set_new(message, "janus", json_string("message"));
+				json_object_set_new(message, "opaque_id", json_string(driverId));
+				json_object_set_new(message, "transaction", json_string(driver->id));
+				json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+				json_object_set_new(message, "handle_id", json_integer(driver->handleId));
+				json_t *body = json_object();
+				json_object_set_new(body, "request", json_string("stop"));
+				json_object_set_new(message, "body", body);
+				//Set driver's streamingCar to NULL
+				driver->carStreamed = NULL;
+				//Set driver's contollingCar to selected car
+				driver->carControlled = NULL;
 
 				goto send_message;
 
@@ -1642,6 +1703,8 @@ tracer_car* tracer_find_car(char* carid)
 		{
 			break;
 		}
+		else
+			car = NULL;
 		tmp_car_list = tmp_car_list->next;
 	}
 	g_free(tmp_car_list);
@@ -1660,6 +1723,8 @@ tracer_driver* tracer_find_driver(char* driverid)
 		{
 			break;
 		}
+		else
+			driver = NULL;
 		tmp_driver_list = tmp_driver_list->next;
 	}
 	g_free(tmp_driver_list);
@@ -1678,6 +1743,8 @@ tracer_driver* tracer_find_driver_by_handle_id(guint64 handleId)
 		{
 			break;
 		}
+		else
+			driver = NULL;
 		tmp_driver_list = tmp_driver_list->next;
 	}
 	g_free(tmp_driver_list);
