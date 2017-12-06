@@ -182,7 +182,7 @@ static gchar *server_name = NULL;
  * polling mechanism is used and shorten them as well, or you'll risk
  * incurring in unexpected timeouts (when HTTP is used in janus.js, the
  * long poll is used as a keepalive mechanism). */
-#define DEFAULT_SESSION_TIMEOUT		60
+#define DEFAULT_SESSION_TIMEOUT		0 //TODO: Keep it in mind. We may need to set it later.
 static uint session_timeout = DEFAULT_SESSION_TIMEOUT;
 
 

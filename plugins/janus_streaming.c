@@ -2689,6 +2689,47 @@ static void *janus_streaming_handler(void *data) {
 			janus_mutex_lock(&mp->mutex);
 			mp->listeners = g_list_append(mp->listeners, session);
 			janus_mutex_unlock(&mp->mutex);
+		} else if(!strcasecmp(request_text, "startstream")) {
+			//Tracer Custom function "watch" and "start" combined
+			JANUS_VALIDATE_JSON_OBJECT(root, watch_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_STREAMING_ERROR_MISSING_ELEMENT, JANUS_STREAMING_ERROR_INVALID_ELEMENT);
+			if(error_code != 0)
+				goto error;
+			json_t *id = json_object_get(root, "id");
+			guint64 id_value = json_integer_value(id);
+			janus_mutex_lock(&mountpoints_mutex);
+			janus_streaming_mountpoint *mp = g_hash_table_lookup(mountpoints, &id_value);
+			if(mp == NULL) {
+				janus_mutex_unlock(&mountpoints_mutex);
+				JANUS_LOG(LOG_VERB, "No such mountpoint/stream %"SCNu64"\n", id_value);
+				error_code = JANUS_STREAMING_ERROR_NO_SUCH_MOUNTPOINT;
+				g_snprintf(error_cause, 512, "No such mountpoint/stream %"SCNu64"", id_value);
+				goto error;
+			}
+			if(error_code != 0) {
+				janus_mutex_unlock(&mountpoints_mutex);
+				goto error;
+			}
+			janus_mutex_unlock(&mountpoints_mutex);
+			JANUS_LOG(LOG_VERB, "Request to watch mountpoint/stream %"SCNu64"\n", id_value);
+			session->stopping = FALSE;
+			session->mountpoint = mp;
+			/* Check what we should offer */
+			session->audio = TRUE;	/* True by default */
+			session->video = TRUE;	/* True by default */
+			session->data = TRUE;	/* True by default */
+
+			if(mp->streaming_source == janus_streaming_source_rtp) {
+				janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)mp->source;
+			}
+			JANUS_LOG(LOG_VERB, "Starting the streaming\n");
+			session->paused = FALSE;
+
+			/* Add the user to the list of watchers and we're done */
+			janus_mutex_lock(&mp->mutex);
+			mp->listeners = g_list_append(mp->listeners, session);
+			janus_mutex_unlock(&mp->mutex);
 		} else if(!strcasecmp(request_text, "start")) {
 			if(session->mountpoint == NULL) {
 				JANUS_LOG(LOG_VERB, "Can't start: no mountpoint set\n");
