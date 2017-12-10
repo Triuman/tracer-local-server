@@ -246,6 +246,7 @@ janus_mutex tracer_driver_list_mutex;
 typedef struct tracer_car {
 	char *id;
 	gint streamId;
+	gint streamCount; //How many Driver is getting camera stream. If zero, send Stop Gstreamer message to the Car.
 	dyad_Stream *socketStream;
 	janus_mutex mutex;						/* Mutex to lock/unlock this session */
 }tracer_car;
@@ -318,6 +319,20 @@ static void tracer_stop_all_streams(void) {
 	g_free(tmp_driver_list);
 	driver = NULL;
 	janus_mutex_unlock(&tracer_driver_list_mutex);
+
+	janus_mutex_lock(&tracer_car_list_mutex);
+	JANUS_LOG(LOG_INFO, "Finding Car with ID: %s\n", carid);
+	tracer_car* car = NULL;
+	GList* tmp_car_list = g_list_first(tracer_car_list);
+	while (tmp_car_list != NULL)
+	{
+		car = (tracer_car*)tmp_car_list->data;
+		JANUS_LOG(LOG_INFO, "Sending Stop Gstreamer to Car with ID: %s\n", car->id);
+		tracer_socket_sendMessage(car->socketStream, "3");
+		tmp_car_list = tmp_car_list->next;
+	}
+	tmp_car_list = NULL;
+	janus_mutex_unlock(&tracer_car_list_mutex);
 }
 
 tracer_car* tracer_find_car(char* carid)
@@ -411,7 +426,7 @@ tracer_driver* tracer_find_driver_by_handle_id(guint64 handleId)
 //Tracer Socket functions for car connection
 
 static void tracer_socket_onData(dyad_Event *e) {
-    //For now, Cars only sends their IDs and nothing else. So nothing to check here.
+    //For now, Cars only send their IDs and nothing else. So nothing to check here.
     //Get ID of the car
     //Car is in e.udata
     tracer_car* car = (tracer_car*)e->udata;
@@ -439,6 +454,7 @@ static void tracer_socket_onAccept(dyad_Event *e) {
 	janus_mutex_lock(&tracer_car_list_mutex);
     janus_mutex_init(&new_tracer_car->mutex);
     new_tracer_car->socketStream = e->remote;
+	new_tracer_car->socketCount = 0;
     tracer_car_list = g_list_append(tracer_car_list, new_tracer_car);
 
     dyad_addListener(e->remote, DYAD_EVENT_DATA, tracer_socket_onData, new_tracer_car);
@@ -1553,7 +1569,7 @@ static int janus_websockets_common_callback(
 			json_t *message = NULL;
             if (!strcasecmp(command_text, "startsession"))
             {
-                //We are not using this right now. We create a session in init. Timeout is set to 0, disabled so we do not need to create a new session.
+                //We are not using this right now. We create a session in init. Timeout is set to 0, disabled so we do not need to create a new session unless we disconnect from Web Server.
                 //Send connect message to plugin
                 json_t *request = json_object();
                 json_object_set_new(request, "janus", json_string("create"));
@@ -1631,7 +1647,7 @@ static int janus_websockets_common_callback(
 			{
 				//{janus: "message", body: {request: "startstream", id: 1}, transaction: "d3pNxxpfMd3d"}
 
-				//Send watch message to plugin
+				//Send startstream message to plugin
 				message = json_object();
 				json_object_set_new(message, "janus", json_string("message"));
 				json_object_set_new(message, "opaque_id", json_string(driverId));
@@ -1645,6 +1661,13 @@ static int janus_websockets_common_callback(
 
 				//Set driver's streamingCar to the selected car
 				driver->carStreamed = car;
+				if (car->streamCount == 0)
+				{
+					//Tell Car to start Gstreamer
+					JANUS_LOG(LOG_INFO, "Sending Start Gstreamer to Car with ID: %s\n", car->id);
+					tracer_socket_sendMessage(car->socketStream, "2");
+				}
+				car->streamCount++;
 
 				goto send_message;
 			} else if (!strcasecmp(command_text, "startstreamandcontrol"))
@@ -1667,6 +1690,15 @@ static int janus_websockets_common_callback(
 				driver->carStreamed = car;
 				//Set driver's contollingCar to selected car
 				driver->carControlled = car;
+				if (car->streamCount <= 0)
+				{
+					car->streamCount = 1;
+					//Tell Car to start Gstreamer
+					JANUS_LOG(LOG_INFO, "Sending Start Gstreamer to Car with ID: %s\n", car->id);
+					tracer_socket_sendMessage(car->socketStream, "2");
+				}
+				else
+					car->streamCount++;
 
 				goto send_message;
 			} else if (!strcasecmp(command_text, "stopstreamandcontrol"))
@@ -1683,6 +1715,18 @@ static int janus_websockets_common_callback(
 				json_t *body = json_object();
 				json_object_set_new(body, "request", json_string("stop"));
 				json_object_set_new(message, "body", body);
+
+				if (driver->carStreamed)
+				{
+					driver->carStreamed->streamCount--;
+					if (driver->carStreamed->streamCount <= 0)
+					{
+						driver->carStreamed->streamCount = 0;
+						//Tell Car to stop Gstreamer
+						JANUS_LOG(LOG_INFO, "Sending Stop Gstreamer to Car with ID: %s\n", driver->carStreamed->id);
+						tracer_socket_sendMessage(driver->carStreamed->socketStream, "3");
+					}
+				}
 				//Set driver's streamingCar to NULL
 				driver->carStreamed = NULL;
 				//Set driver's contollingCar to selected car
@@ -1702,9 +1746,20 @@ static int janus_websockets_common_callback(
 				json_t *body = json_object();
 				json_object_set_new(body, "request", json_string("stop"));
 				json_object_set_new(message, "body", body);
+
+				if (driver->carStreamed)
+				{
+					driver->carStreamed->streamCount--;
+					if (driver->carStreamed->streamCount <= 0)
+					{
+						driver->carStreamed->streamCount = 0;
+						//Tell Car to stop Gstreamer
+						JANUS_LOG(LOG_INFO, "Sending Stop Gstreamer to Car with ID: %s\n", driver->carStreamed->id);
+						tracer_socket_sendMessage(driver->carStreamed->socketStream, "3");
+					}
+				}
 				//Set driver's streamingCar to NULL
 				driver->carStreamed = NULL;
-
 				goto send_message;
 
 			} else if (!strcasecmp(command_text, "givecontrol"))
