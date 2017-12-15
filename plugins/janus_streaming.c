@@ -182,8 +182,8 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 void janus_streaming_setup_media(janus_plugin_session *handle);
 void janus_streaming_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len);
 void janus_streaming_incoming_rtcp(janus_plugin_session *handle, int video, char *buf, int len);
-void janus_textroom_incoming_data(janus_plugin_session *handle, char *buf, int len);
-void janus_textroom_slow_link(janus_plugin_session *handle, int uplink, int video);
+void janus_streaming_incoming_data(janus_plugin_session *handle, char *buf, int len);
+void janus_streaming_slow_link(janus_plugin_session *handle, int uplink, int video);
 void janus_streaming_hangup_media(janus_plugin_session *handle);
 void janus_streaming_destroy_session(janus_plugin_session *handle, int *error);
 json_t *janus_streaming_query_session(janus_plugin_session *handle);
@@ -208,8 +208,8 @@ static janus_plugin janus_streaming_plugin =
 		.setup_media = janus_streaming_setup_media,
 		.incoming_rtp = janus_streaming_incoming_rtp,
 		.incoming_rtcp = janus_streaming_incoming_rtcp,
-		.incoming_data = janus_textroom_incoming_data,
-		.slow_link = janus_textroom_slow_link,
+		.incoming_data = janus_streaming_incoming_data,
+		.slow_link = janus_streaming_slow_link,
 		.hangup_media = janus_streaming_hangup_media,
 		.destroy_session = janus_streaming_destroy_session,
 		.query_session = janus_streaming_query_session,
@@ -2283,7 +2283,7 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 		response = json_object();
 		json_object_set_new(response, "streaming", json_string("ok"));
 		goto plugin_response;
-	} else if(!strcasecmp(request_text, "connect") || !strcasecmp(request_text, "watch") || !strcasecmp(request_text, "start")
+	} else if(!strcasecmp(request_text, "connect") || !strcasecmp(request_text, "acceptanswer") || !strcasecmp(request_text, "watch") || !strcasecmp(request_text, "start")
 			|| !strcasecmp(request_text, "pause") || !strcasecmp(request_text, "stop")
 			|| !strcasecmp(request_text, "configure") || !strcasecmp(request_text, "switch")) {
 		/* These messages are handled asynchronously */
@@ -2345,43 +2345,7 @@ void janus_streaming_setup_media(janus_plugin_session *handle) {
 	g_atomic_int_set(&session->hangingup, 0);
 	/* We only start streaming towards this user when we get this event */
 	janus_rtp_switching_context_reset(&session->context);
-	/* If this is related to a live RTP mountpoint, any keyframe we can shoot already? */
-	janus_streaming_mountpoint *mountpoint = session->mountpoint;
-	if(mountpoint->streaming_source == janus_streaming_source_rtp) {
-		janus_streaming_rtp_source *source = mountpoint->source;
-		if(source->keyframe.enabled) {
-			JANUS_LOG(LOG_HUGE, "Any keyframe to send?\n");
-			janus_mutex_lock(&source->keyframe.mutex);
-			if(source->keyframe.latest_keyframe != NULL) {
-				JANUS_LOG(LOG_HUGE, "Yep! %d packets\n", g_list_length(source->keyframe.latest_keyframe));
-				GList *temp = source->keyframe.latest_keyframe;
-				while(temp) {
-					janus_streaming_relay_rtp_packet(session, temp->data);
-					temp = temp->next;
-				}
-			}
-			janus_mutex_unlock(&source->keyframe.mutex);
-		}
-		if(source->buffermsg) {
-			JANUS_LOG(LOG_HUGE, "Any recent datachannel message to send?\n");
-			janus_mutex_lock(&source->buffermsg_mutex);
-			if(source->last_msg != NULL) {
-				JANUS_LOG(LOG_HUGE, "Yep!\n");
-				janus_streaming_relay_rtp_packet(session, source->last_msg);
-			}
-			janus_mutex_unlock(&source->buffermsg_mutex);
-		}
-	}
-	session->started = TRUE;
-	/* Prepare JSON event */
-	json_t *event = json_object();
-	json_object_set_new(event, "streaming", json_string("event"));
-	json_t *result = json_object();
-	json_object_set_new(result, "status", json_string("started"));
-	json_object_set_new(event, "result", result);
-	int ret = gateway->push_event(handle, &janus_streaming_plugin, NULL, event, NULL);
-	JANUS_LOG(LOG_VERB, "  >> Pushing event: %d (%s)\n", ret, janus_get_api_error(ret));
-	json_decref(event);
+	session->started = FALSE; //We keep this false for now. Only set to true when Driver is streaming a Car.
 }
 
 void janus_streaming_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len) {
@@ -2402,7 +2366,7 @@ void janus_streaming_incoming_rtcp(janus_plugin_session *handle, int video, char
 	/* FIXME Maybe we should care about RTCP, but not now */
 }
 
-void janus_textroom_incoming_data(janus_plugin_session *handle, char *buf, int len) {
+void janus_streaming_incoming_data(janus_plugin_session *handle, char *buf, int len) {
 	if (handle == NULL || handle->stopped || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
 	/* Incoming request from this user: what should we do? */
@@ -2420,7 +2384,7 @@ void janus_textroom_incoming_data(janus_plugin_session *handle, char *buf, int l
 	*(text + len) = '\0';
 	JANUS_LOG(LOG_VERB, "Got a DataChannel message (%zu bytes): %s\n", strlen(text), text);
 
-	//Send message to transport directly
+	//Send message to transport directly and process it there.
 	json_t *event = json_object();
 	json_object_set_new(event, "streaming", json_string("message"));
 	json_object_set_new(event, "message", json_string(text));
@@ -2442,7 +2406,7 @@ void janus_textroom_incoming_data(janus_plugin_session *handle, char *buf, int l
 }
 
 
-void janus_textroom_slow_link(janus_plugin_session *handle, int uplink, int video) {
+void janus_streaming_slow_link(janus_plugin_session *handle, int uplink, int video) {
 	//TODO: Let web server know
 }
 
@@ -2530,11 +2494,14 @@ static void *janus_streaming_handler(void *data) {
 		const char *sdp_type = NULL;
 		char *sdp = NULL;
 		/* All these requests can only be handled asynchronously */
-		if(!strcasecmp(request_text, "connect")) {		
-			
+      if(!strcasecmp(request_text, "acceptanswer")) {		
+         //Just to be sure Janus process the answer jsep.
+      }else if(!strcasecmp(request_text, "connect")) {	
+         JANUS_LOG(LOG_VERB, "We got a Connect request\n");
 			json_t *id = json_object_get(root, "id");
 			guint64 id_value = json_integer_value(id);
 			janus_mutex_lock(&mountpoints_mutex);
+         JANUS_LOG(LOG_VERB, "We passed mutex lock -> mountpoints_mutex\n");
 			janus_streaming_mountpoint *mp = g_hash_table_lookup(mountpoints, &id_value);
 			if (mp == NULL) {
 				janus_mutex_unlock(&mountpoints_mutex);
@@ -2620,6 +2587,7 @@ static void *janus_streaming_handler(void *data) {
 			g_strlcat(sdptemp, buffer, 2048);
 			
 #endif
+         janus_mutex_unlock(&mountpoints_mutex);
 			sdp = g_strdup(sdptemp);
 			JANUS_LOG(LOG_VERB, "Going to offer this SDP:\n%s\n", sdp);
 			result = json_object();
@@ -4611,6 +4579,7 @@ static void *janus_streaming_relay_thread(void *data) {
 	JANUS_LOG(LOG_VERB, "[%s] Leaving streaming relay thread\n", name);
 	g_free(name);
 	g_thread_unref(g_thread_self());
+	JANUS_LOG(LOG_VERB, "[%s] Freed\n", name);
 	return NULL;
 }
 

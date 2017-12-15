@@ -52,3 +52,5 @@ Makefile.in
 
 .deps
 .dirstamp
+.vscode/settings.json
+core
