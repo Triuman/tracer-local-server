@@ -54,3 +54,10 @@ Makefile.in
 .dirstamp
 .vscode/settings.json
 core
+.idea/modules.xml
+.idea/misc.xml
+.idea/tracer-local-server.iml
+.idea/vcs.xml
+.idea/workspace.xml
+.idea/codeStyles/Project.xml
+cmake-build-debug/CMakeFiles/clion-log.txt
