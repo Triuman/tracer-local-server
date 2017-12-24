@@ -377,6 +377,7 @@ or on the command line:
 Options passed through the command line have the precedence on those
 specified in the configuration file. To start the gateway, simply run:
 
+	export LD_LIBRARY_PATH=/usr/lib64
 	<installdir>/bin/janus
 
 This will start the gateway, and have it look at the configuration file.
