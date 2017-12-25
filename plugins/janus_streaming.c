@@ -1313,7 +1313,22 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 	json_t *request = json_object_get(root, "request");
 	/* Some requests ('create' and 'destroy') can be handled synchronously */
 	const char *request_text = json_string_value(request);
-	if(!strcasecmp(request_text, "list")) {
+   if(!strcasecmp(request_text, "sendmessagetodriver")) {
+      //Websocket Transport call this to send message to the driver.
+
+      json_t *webrtc_message = json_object_get(root, "webrtc_message");
+      const char* webrtc_message_string = json_string_value(webrtc_message);
+      
+      if(gateway) {
+         /* Save the frame if we're recording */
+         gateway->relay_data(handle, webrtc_message_string, strlen(webrtc_message_string));
+         g_free(webrtc_message_string);
+      }
+      /* Send ack */
+		response = json_object();
+      json_object_set_new(response, "streaming", json_string("ok"));
+      goto plugin_response;
+   }else if(!strcasecmp(request_text, "list")) {
 		json_t *list = json_array();
 		JANUS_LOG(LOG_VERB, "Request for the list of mountpoints\n");
 		/* Return a list of all available mountpoints */
