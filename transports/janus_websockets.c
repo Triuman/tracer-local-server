@@ -26,6 +26,8 @@
  * \ref transports
  */
 
+//export LD_LIBRARY_PATH=/usr/lib64
+
 #include "transport.h"
 
 #include <arpa/inet.h>
@@ -271,13 +273,14 @@ typedef struct tracer_race
    struct tracer_track *track;
    GList *car_list;
    struct tracer_car *car_ranking_list[4]; //We add the car to here when it finishes the race.
-   int finished_car_count; //This is the number of cars that finished all the laps. If finished_car_count = car_count, finish the race.
+   int finished_car_count;                 //This is the number of cars that finished all the laps. If finished_car_count = car_count, finish the race.
    int car_count;
    int lap_count; //How many laps this race has in total.
    gint64 start_time;
    gint32 elapsed_time; //we increase this by one each second.
-   int max_duration; //in seconds. If racers do not finish the laps in max_duration time, we finish the race automatically.
+   int max_duration;    //in seconds. If racers do not finish the laps in max_duration time, we finish the race automatically.
    gboolean is_started;
+   gboolean is_paused;
    gboolean is_finished;
    janus_mutex mutex; /* Mutex to lock/unlock this session */
 } tracer_race;
@@ -292,27 +295,27 @@ typedef struct tracer_car
    struct tracer_driver *driver; //We use this to determine ranking of drivers by cars ranking. This is the ultimate driver who owns and controls the car. We set this driver when we get a giveControlOfCar command. Sometimes we can give stream of this car to someone else for action purposes. But this driver will be shown in the ranking list.
    double *lap_times;
    gint32 finish_time; //we set this when car finishes the race to race->elapsed_time. We use this or progress value to determine ranking.
-   int lap_count;     //how many laps this car passed
-   double progress; //How much of track this car completed so far. value is 0-1 per lap.
-   janus_mutex mutex; /* Mutex to lock/unlock this session */
+   int lap_count;      //how many laps this car passed
+   double progress;    //How much of track this car completed so far. value is 0-1 per lap.
+   janus_mutex mutex;  /* Mutex to lock/unlock this session */
 } tracer_car;
 
 typedef struct tracer_driver
 {
    char *id;
    struct tracer_car *car;  //The car driver is controlling and most likely also streming. The game may let a driver stream other drivers' cars.
-   gboolean is_online; //if driver disconnect, we do not remove it from the list. We set is_online FALSE and wait him to come back.
+   gboolean is_online;      //if driver disconnect, we do not remove it from the list. We set is_online FALSE and wait him to come back.
    gboolean is_controlling; //If FALSE, we dont rely driver's commands to the car.
    guint64 handle_id;
-   janus_mutex mutex;        /* Mutex to lock/unlock this session */
+   janus_mutex mutex; /* Mutex to lock/unlock this session */
 } tracer_driver;
 
 janus_websockets_client *tracer_webserver_ws_client = NULL; //The only connection coming from the web server.
 
 //Tracer Method Definitions
 
-static void tracer_cut_all_controls(char* race_id);
-static void tracer_stop_all_streams(char* race_id);
+static void tracer_cut_all_controls(char *race_id);
+static void tracer_stop_all_streams(char *race_id);
 tracer_car *tracer_find_car(char *carid);
 tracer_driver *tracer_find_driver(char *driverid);
 void tracer_remove_driver(char *driverid);
@@ -324,6 +327,7 @@ static void tracer_socket_sendMessage(dyad_Stream *socket_stream, char *message)
 void tracer_send_message_to_web_server(json_t *message);
 void tracer_read_mountpoint_list(char *config_path);
 tracer_mountpoint *tracer_get_available_mountpoint();
+gint granking_compare(gconstpointer ptr_car1, gconstpointer ptr_car2);
 
 //Race Methods
 void tracer_on_car_progress_change(tracer_car *car, int progress); //progress is between 0 and 1 for each lap.
@@ -332,7 +336,7 @@ void tracer_on_car_finish_race(tracer_car *car);
 void tracer_on_race_finish(tracer_race *race);
 
 //Tracer helper methods
-static void tracer_cut_all_controls(char* race_id)
+static void tracer_cut_all_controls(char *race_id)
 {
    janus_mutex_lock(&tracer_driver_list_mutex);
    tracer_driver *driver = NULL;
@@ -340,7 +344,8 @@ static void tracer_cut_all_controls(char* race_id)
    while (tmp_driver_list != NULL)
    {
       driver = (tracer_driver *)tmp_driver_list->data;
-      if(driver->car && driver->car->race && !strcasecmp(driver->car->race->id, race_id)){
+      if (driver->car && driver->car->race && !strcasecmp(driver->car->race->id, race_id))
+      {
          driver->is_controlling = FALSE;
       }
       tmp_driver_list = tmp_driver_list->next;
@@ -350,7 +355,7 @@ static void tracer_cut_all_controls(char* race_id)
    janus_mutex_unlock(&tracer_driver_list_mutex);
 }
 
-static void tracer_stop_all_streams(char* race_id)
+static void tracer_stop_all_streams(char *race_id)
 {
    janus_mutex_lock(&tracer_driver_list_mutex);
    tracer_driver *driver = NULL;
@@ -358,7 +363,7 @@ static void tracer_stop_all_streams(char* race_id)
    while (tmp_driver_list != NULL)
    {
       driver = (tracer_driver *)tmp_driver_list->data;
-      if(driver->car && driver->car->race && !strcasecmp(driver->car->race->id, race_id))
+      if (driver->car && driver->car->race && !strcasecmp(driver->car->race->id, race_id))
       {
          //Send stop message to plugin
          json_t *message = json_object();
@@ -434,6 +439,40 @@ tracer_race *tracer_find_race(char *raceid)
    janus_mutex_unlock(&tracer_race_list_mutex);
    return race;
 }
+
+void tracer_remove_race(char *raceid)
+{
+   janus_mutex_lock(&tracer_race_list_mutex);
+   //Find the race with the given ID
+   tracer_race *race = NULL;
+   GList *tmp_race_list = g_list_first(tracer_race_list);
+   while (tmp_race_list != NULL)
+   {
+      race = (tracer_race *)tmp_race_list->data;
+      if (!strcasecmp(race->id, raceid))
+      {
+         tracer_car *car = NULL;
+         GList *tmp_car_list = g_list_first(tracer_race_list);
+         while (tmp_car_list != NULL)
+         {
+            car = (tracer_car *)tmp_car_list->data;
+            if(car){
+               car->race = NULL;
+               //We also remove the driver from our list.
+               if(car->driver)
+                  tracer_driver_list = g_list_remove(tracer_driver_list, car->driver);
+            }
+            tmp_race_list = tmp_race_list->next;
+         }
+         tracer_race_list = g_list_remove(tracer_race_list, tmp_race_list->data);
+         break;
+      }
+      tmp_race_list = tmp_race_list->next;
+   }
+   tmp_race_list = NULL;
+   janus_mutex_unlock(&tracer_race_list_mutex);
+}
+
 tracer_car *tracer_find_car(char *carid)
 {
    janus_mutex_lock(&tracer_car_list_mutex);
@@ -627,15 +666,15 @@ void *tracer_race_thread(void *data)
       while (tmp_race_list != NULL)
       {
          race = (tracer_race *)tmp_race_list->data;
-         if (race && race->is_started)
+         if (race && race->is_started && !race->is_paused && !race->is_finished)
          {
             race->elapsed_time++;
-            if(race->elapsed_time >= race->max_duration)
+            if (race->elapsed_time >= race->max_duration)
                tracer_on_race_finish(race);
 
             //We send progress updates of driver in the race to drivers and Web Server here
             //update: [{driver_id: "", lap_count: 1, progress: 53}]
-            guint64* driver_handle_ids[4];
+            guint64 *driver_handle_ids[4];
             int driver_handle_id_index = 0;
             json_t *updates = json_array();
             janus_mutex_lock(&race->mutex);
@@ -658,9 +697,10 @@ void *tracer_race_thread(void *data)
             }
             tmp_car_list = NULL;
             janus_mutex_unlock(&race->mutex);
-            
+
             char *payload = json_dumps(updates, json_format);
-            for(int d=driver_handle_id_index-1;d>=0;d--){
+            for (int d = driver_handle_id_index - 1; d >= 0; d--)
+            {
                //Send update message to driver throught gateway
                json_t *request = json_object();
                json_object_set_new(request, "janus", json_string("message"));
@@ -1341,7 +1381,7 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
          JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the WebSockets thread...\n", error->code, error->message ? error->message : "??");
          return -1;
       }
-   } 
+   }
    /* Start the Socket Server service thread */
    socket_server_thread = g_thread_try_new("Socket Server thread", &tracer_socket_server_thread, NULL, &error);
    if (!socket_server_thread)
@@ -1350,7 +1390,7 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
       JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the Socket Server thread...\n", error->code, error->message ? error->message : "??");
       return -1;
    }
-   
+
    /* Start the Socket Server service thread */
    race_thread = g_thread_try_new("Race thread", &tracer_race_thread, NULL, &error);
    if (!race_thread)
@@ -1592,7 +1632,6 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
                tracer_socket_sendMessage(driver->car->socket_stream, carCommand);
             }
          }
-         
       }
       else if (!strcasecmp(streaming_text, "event"))
       {
@@ -1677,7 +1716,7 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
       json_object_set_new(info, "info", json_string("hangup"));
       json_object_set_new(info, "driverid", json_string(driver->id));
 
-      if(driver)
+      if (driver)
          driver->is_online = FALSE;
 
       goto send_info;
@@ -1829,19 +1868,23 @@ static int janus_websockets_callback_https(
    return janus_websockets_callback_http(wsi, reason, user, in, len);
 }
 
-
 /* Race Methods */
 
 //progress is between 0 and 1 for each lap.
 void tracer_on_car_progress_change(tracer_car *car, int progress)
 {
-   if(car->progress > 0.7 && progress < 0.3){ //if car was almost end of the track and now at around beginning then he passed the finish line in forward.
+   if (car->progress > 0.7 && progress < 0.3)
+   { //if car was almost end of the track and now at around beginning then he passed the finish line in forward.
       car->progress = progress;
       tracer_on_car_pass_finish_line(car, TRUE);
-   }else if(car->progress < 0.3 && progress > 0.7){ //Drivers went backwards and passed the finish line.
+   }
+   else if (car->progress < 0.3 && progress > 0.7)
+   { //Drivers went backwards and passed the finish line.
       car->progress = progress;
       tracer_on_car_pass_finish_line(car, FALSE);
-   }else{
+   }
+   else
+   {
       car->progress = progress;
    }
 }
@@ -1865,35 +1908,156 @@ void tracer_on_car_finish_race(tracer_car *car)
 {
    car->race->finished_car_count++;
    car->finish_time = car->race->elapsed_time;
-   if(car->race->finished_car_count >= car->race->car_count){
+   car->progress = 0;
+   car->race->car_ranking_list[car->race->finished_car_count - 1] = car;
+   if (car->race->finished_car_count >= car->race->car_count)
+   {
       tracer_on_race_finish(car->race);
-   }else{
-      //TODO: Let both driver and Web Server know about the driver finishes race.
+   }
+   else
+   {
+      //TODO: Let both drivers and Web Server know about the driver finishes race.
    }
 }
 void tracer_on_race_finish(tracer_race *race)
 {
-   if(race->is_finished) //Already finished.
+   if (race->is_finished) //Already finished.
       return;
 
-   race->is_started = FALSE;
    race->is_finished = TRUE;
 
    //Get the ranking info and send it to both drivers and Web Server.
+   race->car_list = g_list_sort(race->car_list, granking_compare);
+
+   //We send ranking of the race to drivers and Web Server here
+   //ranking: [{driver_id: "", finished_time: 3333}]
+   guint64 *driver_handle_ids[4];
+   int driver_handle_id_index = 0;
+   json_t *ranking = json_array();
    janus_mutex_lock(&race->mutex);
    tracer_car *car = NULL;
    GList *tmp_car_list = g_list_first(race->car_list);
    while (tmp_car_list != NULL)
    {
       car = (tracer_car *)tmp_car_list->data;
-      if (car->finish_time)
+      if (car && car->driver)
       {
-         car->driver->is_controlling = TRUE;
+         driver_handle_ids[driver_handle_id_index++] = car->driver->handle_id;
+
+         json_t *ranking_item = json_object();
+         json_object_set_new(ranking_item, "driver_id", json_string(car->driver->id));
+         json_object_set_new(ranking_item, "finished_time", json_integer(car->lap_count));
+         json_array_append(ranking, ranking_item);
       }
       tmp_car_list = tmp_car_list->next;
    }
    tmp_car_list = NULL;
    janus_mutex_unlock(&race->mutex);
+
+   char *payload = json_dumps(ranking, json_format);
+   for (int d = driver_handle_id_index - 1; d >= 0; d--)
+   {
+      //Send update message to driver throught gateway
+      json_t *request = json_object();
+      json_object_set_new(request, "janus", json_string("message"));
+      json_object_set_new(request, "transaction", json_string("webtrc_message"));
+      json_t *body = json_object();
+      json_object_set_new(body, "request", json_string("sendmessagetodriver"));
+      json_object_set_new(body, "webrtc_message", json_string(payload));
+      json_object_set_new(request, "body", body);
+      json_object_set_new(request, "session_id", json_integer(tracer_session_id));
+      json_object_set_new(request, "handle_id", json_integer(driver_handle_ids[d]));
+
+      gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, request, NULL);
+
+      //TODO: We may need to put a sleep here since we close Webrtc connection just after sending a message.
+
+      //We close the webrtc connection after sending ranking
+      request = json_object();
+      json_object_set_new(request, "janus", json_string("hangup"));
+      json_object_set_new(request, "transaction", json_string("race_finished"));
+      json_object_set_new(request, "session_id", json_integer(tracer_session_id));
+      json_object_set_new(request, "handle_id", json_integer(driver_handle_ids[d]));
+      gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, request, NULL);
+   }
+
+   json_t *info = json_object();
+   json_object_set_new(info, "info", json_string("ranking"));
+   json_object_set_new(info, "race_id", json_string(race->id));
+   json_object_set_new(info, "ranking", ranking);
+   tracer_send_message_to_web_server(info);
+   
+   //Removing race will remove drivers too.
+   tracer_remove_race(race->id);
+}
+
+void tracer_on_race_abort(tracer_race *race)
+{
+   int driver_handle_id_index = 0;
+   json_t *abort_message = json_object();
+   json_object_set_new(abort_message, "abort", json_integer(0));
+   char *payload = json_dumps(abort_message, json_format);
+   janus_mutex_lock(&race->mutex);
+   tracer_car *car = NULL;
+   GList *tmp_car_list = g_list_first(race->car_list);
+   while (tmp_car_list != NULL)
+   {
+      car = (tracer_car *)tmp_car_list->data;
+      if (car && car->driver)
+      {
+         //Send abort message to driver throught gateway
+         json_t *request = json_object();
+         json_object_set_new(request, "janus", json_string("message"));
+         json_object_set_new(request, "transaction", json_string("webtrc_message"));
+         json_t *body = json_object();
+         json_object_set_new(body, "request", json_string("sendmessagetodriver"));
+         json_object_set_new(body, "webrtc_message", json_string(payload));
+         json_object_set_new(request, "body", body);
+         json_object_set_new(request, "session_id", json_integer(tracer_session_id));
+         json_object_set_new(request, "handle_id", json_integer(car->driver->handle_id));
+         gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, request, NULL);
+
+         //TODO: We may need to put a sleep here since we close Webrtc connection just after sending a message.
+
+         //We close the webrtc connection after sending ranking
+         request = json_object();
+         json_object_set_new(request, "janus", json_string("hangup"));
+         json_object_set_new(request, "transaction", json_string("race_aborted"));
+         json_object_set_new(request, "session_id", json_integer(tracer_session_id));
+         json_object_set_new(request, "handle_id", json_integer(car->driver->handle_id));
+         gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, request, NULL);
+      }
+      tmp_car_list = tmp_car_list->next;
+   }
+   tmp_car_list = NULL;
+   janus_mutex_unlock(&race->mutex);
+
+   //Removing race will remove drivers too.
+   tracer_remove_race(race->id);
+}
+
+gint granking_compare(gconstpointer ptr_car1, gconstpointer ptr_car2)
+{
+   struct tracer_car *car1;
+   struct tracer_car *car2;
+   car1 = (tracer_car *)ptr_car1;
+   car2 = (tracer_car *)ptr_car2;
+
+   double car1_total_progress = car1->lap_count + car1->progress;
+   double car2_total_progress = car2->lap_count + car2->progress;
+
+   if (car1_total_progress > car2_total_progress)
+      return 1;
+   if (car1_total_progress < car2_total_progress)
+      return -1;
+
+   //If their total progresses are same, then they both finished the race before timeout. SO we check their finished_times.
+   if (car1->finish_time < car2->finish_time)
+      return 1;
+   if (car1->finish_time > car2->finish_time)
+      return -1;
+
+   return 0;
 }
 
 double sqr(double x)
@@ -2253,14 +2417,18 @@ static int janus_websockets_common_callback(
          JANUS_LOG(LOG_INFO, "New race added to the list : %s\n", newRaceId);
 
          json_t *max_duration = json_object_get(root, "max_duration");
-         if(max_duration){
+         if (max_duration)
+         {
             race->max_duration = json_integer_value(max_duration);
-         }else{
+         }
+         else
+         {
             race->max_duration = 0;
          }
 
          race->track = track;
          race->is_started = FALSE;
+         race->is_paused = FALSE;
          race->is_finished = FALSE;
 
          size_t driver_id_index;
@@ -2274,7 +2442,7 @@ static int janus_websockets_common_callback(
          {
             char *driver_id_string = json_string_value(driver_id);
             tracer_driver *driver = tracer_find_driver(driver_id_string);
-            
+
             if (driver == NULL)
             {
                //We create a new driver. And create a handle for him by attach request.
@@ -2289,7 +2457,8 @@ static int janus_websockets_common_callback(
                janus_mutex_unlock(&tracer_driver_list_mutex);
                JANUS_LOG(LOG_INFO, "New driver added to the list : %s\n", driver_id);
             }
-            if(driver->handle_id == NULL){
+            if (driver->handle_id == NULL)
+            {
                message = json_object();
                json_object_set_new(message, "janus", json_string("attach"));
                json_object_set_new(message, "plugin", json_string("janus.plugin.streaming"));
@@ -2302,20 +2471,23 @@ static int janus_websockets_common_callback(
             }
 
             json_t *car_id = json_array_get(car_ids, driver_id_index);
-            if(car_id){
+            if (car_id)
+            {
                tracer_car *car = tracer_find_car(json_string_value(json_array_get(car_id, driver_id_index))); //we get the car id at the same index with the driver.
-               if(car == NULL){
-                     car = g_malloc0(sizeof(tracer_car));
-                     janus_mutex_init(&car->mutex);
-                     janus_mutex_lock(&tracer_car_list_mutex);
-                     tracer_car_list = g_list_append(tracer_car_list, car);
-                     janus_mutex_unlock(&tracer_car_list_mutex);
+               if (car == NULL)
+               {
+                  car = g_malloc0(sizeof(tracer_car));
+                  janus_mutex_init(&car->mutex);
+                  janus_mutex_lock(&tracer_car_list_mutex);
+                  tracer_car_list = g_list_append(tracer_car_list, car);
+                  janus_mutex_unlock(&tracer_car_list_mutex);
                }
                car->progress = 0;
                car->driver = driver;
                driver->car = car;
                //We first should remove car from its curent race.
-               if(car->race){
+               if (car->race)
+               {
                   car->race->car_list = g_list_remove(car->race->car_list, car);
                   car->race->car_count--;
                }
@@ -2339,11 +2511,14 @@ static int janus_websockets_common_callback(
          car->race->car_count++;
          car->race = race;
          car->race->car_list = g_list_append(car->race->car_list, car);
-         if(driver){
+         if (driver)
+         {
             //If we also get a driver_id, we connect driver to the car.
-            if(car->driver){
+            if (car->driver)
+            {
                //If car has already a driver, we remove him from this car.
-               if(strcasecmp(car->driver->car->id, car->id)){
+               if (strcasecmp(car->driver->car->id, car->id))
+               {
                   //We check if driver's current car is the same with the car given by Web Server.
                   car->driver->car = NULL;
                   car->driver->is_controlling = FALSE;
@@ -2362,7 +2537,7 @@ static int janus_websockets_common_callback(
             car->race->car_count--;
             tracer_race *race = car->race;
             car->race = NULL;
-            if(race->finished_car_count >= race->car_count)
+            if (race->finished_car_count >= race->car_count)
                tracer_on_race_finish(car->race);
          }
       }
@@ -2371,6 +2546,8 @@ static int janus_websockets_common_callback(
          //TODO: Do a countdown before starting the race.
          race->start_time = janus_get_monotonic_time();
          race->is_started = TRUE;
+         race->is_paused = FALSE;
+         race->is_finished = FALSE;
 
          janus_mutex_lock(&race->mutex);
          tracer_car *car = NULL;
@@ -2378,7 +2555,7 @@ static int janus_websockets_common_callback(
          while (tmp_car_list != NULL)
          {
             car = (tracer_car *)tmp_car_list->data;
-            if (car->finish_time)
+            if (car->driver)
             {
                car->driver->is_controlling = TRUE;
             }
@@ -2386,12 +2563,24 @@ static int janus_websockets_common_callback(
          }
          tmp_car_list = NULL;
          janus_mutex_unlock(&race->mutex);
-         
+
          goto send_message;
+      }
+      else if (!strcasecmp(command_text, "pauserace"))
+      {
+         race->is_paused = TRUE;
+      }
+      else if (!strcasecmp(command_text, "resumerace"))
+      {
+         race->is_paused = FALSE;
       }
       else if (!strcasecmp(command_text, "endrace"))
       {
          tracer_on_race_finish(race);
+      }
+      else if (!strcasecmp(command_text, "abortrace"))
+      {
+         tracer_on_race_abort(race);
       }
       else if (!strcasecmp(command_text, "connecttodriver"))
       {
@@ -2412,7 +2601,9 @@ static int janus_websockets_common_callback(
          driver = tracer_find_driver(newDriverId);
          if (driver != NULL)
          {
-         }else{
+         }
+         else
+         {
             driver = g_malloc0(sizeof(tracer_driver));
             janus_mutex_init(&driver->mutex);
             driver->id = (char *)newDriverId;
@@ -2423,7 +2614,8 @@ static int janus_websockets_common_callback(
             JANUS_LOG(LOG_INFO, "New driver added to the list : %s\n", newDriverId);
          }
 
-         if(driver->is_online){
+         if (driver->is_online)
+         {
             json_t *info = json_object();
             json_object_set_new(info, "info", json_string("webrtcup"));
             json_object_set_new(info, "driverid", json_string(driver->id));
@@ -2440,8 +2632,11 @@ static int janus_websockets_common_callback(
             json_decref(info);
             json_decref(message);
             return 0;
-         }else{
-            if(driver->handle_id){
+         }
+         else
+         {
+            if (driver->handle_id)
+            {
                //We only send a connect message to plugin.
                message = json_object();
                json_object_set_new(message, "janus", json_string("message"));
@@ -2452,7 +2647,9 @@ static int janus_websockets_common_callback(
                json_object_set_new(message, "body", body);
                json_object_set_new(message, "session_id", json_integer(tracer_session_id));
                json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
-            }else{
+            }
+            else
+            {
                message = json_object();
                json_object_set_new(message, "janus", json_string("attach"));
                json_object_set_new(message, "plugin", json_string("janus.plugin.streaming"));
