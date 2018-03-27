@@ -1320,7 +1320,6 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
       const char* webrtc_message_string = json_string_value(webrtc_message);
       
       if(gateway) {
-         /* Save the frame if we're recording */
          gateway->relay_data(handle, webrtc_message_string, strlen(webrtc_message_string));
          g_free(webrtc_message_string);
       }
