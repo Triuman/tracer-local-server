@@ -2297,7 +2297,8 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 		response = json_object();
 		json_object_set_new(response, "streaming", json_string("ok"));
 		goto plugin_response;
-	} else if(!strcasecmp(request_text, "connect") || !strcasecmp(request_text, "acceptanswer") || !strcasecmp(request_text, "watch") || !strcasecmp(request_text, "start")
+	} else if(!strcasecmp(request_text, "acceptanswer")  || !strcasecmp(request_text, "startstream")  || !strcasecmp(request_text, "stopstream") 
+			|| !strcasecmp(request_text, "connect") ||  !strcasecmp(request_text, "watch") || !strcasecmp(request_text, "start")
 			|| !strcasecmp(request_text, "pause") || !strcasecmp(request_text, "stop")
 			|| !strcasecmp(request_text, "configure") || !strcasecmp(request_text, "switch")) {
 		/* These messages are handled asynchronously */
@@ -2673,13 +2674,17 @@ static void *janus_streaming_handler(void *data) {
 			janus_mutex_unlock(&mp->mutex);
 		} else if(!strcasecmp(request_text, "startstream")) {
 			//Tracer Custom function "watch" and "start" combined
-			JANUS_VALIDATE_JSON_OBJECT(root, watch_parameters,
-				error_code, error_cause, TRUE,
-				JANUS_STREAMING_ERROR_MISSING_ELEMENT, JANUS_STREAMING_ERROR_INVALID_ELEMENT);
-			if(error_code != 0)
-				goto error;
 			json_t *id = json_object_get(root, "id");
 			guint64 id_value = json_integer_value(id);
+
+			if(session->mountpoint != NULL && session->mountpoint->id != id_value) {
+				//There is a already different mountpoint attach. First stop that stream.
+				JANUS_LOG(LOG_VERB, "We send pause command to previous camera.\n");
+				if(janus_streaming_rtsp_pause((janus_streaming_rtp_source *)session->mountpoint->source) < 0) {
+					JANUS_LOG(LOG_WARN, "[%s] RTSP PAUSE failed, ignoring.\n", name);
+				}	
+			}
+
 			janus_mutex_lock(&mountpoints_mutex);
 			janus_streaming_mountpoint *mp = g_hash_table_lookup(mountpoints, &id_value);
 			if(mp == NULL) {
@@ -2704,6 +2709,10 @@ static void *janus_streaming_handler(void *data) {
 
 			if(mp->streaming_source == janus_streaming_source_rtp) {
 				janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)mp->source;
+				if(janus_streaming_rtsp_play(source) < 0) {
+					//TODO: Play command failed. It probably will not try again to send a play command. Do something so it tries again.
+					JANUS_LOG(LOG_WARN, "[%s] RTSP PLAY failed.\n", name);
+				}
 			}
 			JANUS_LOG(LOG_VERB, "Starting the streaming\n");
 			session->paused = FALSE;
@@ -2712,6 +2721,14 @@ static void *janus_streaming_handler(void *data) {
 			janus_mutex_lock(&mp->mutex);
 			mp->listeners = g_list_append(mp->listeners, session);
 			janus_mutex_unlock(&mp->mutex);
+		} else if(!strcasecmp(request_text, "stopstream")) {
+			//Send a Pause command to the camera.
+			janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)session->mountpoint->source;
+			if(janus_streaming_rtsp_pause(source) < 0) {
+				JANUS_LOG(LOG_WARN, "[%s] RTSP PAUSE failed, ignoring.\n", name);
+			}
+			//Even though camera keeps streaming, this line will prevent stream to be realyed to the driver.
+			session->paused = TRUE;
 		} else if(!strcasecmp(request_text, "start")) {
 			if(session->mountpoint == NULL) {
 				JANUS_LOG(LOG_VERB, "Can't start: no mountpoint set\n");
@@ -3735,6 +3752,31 @@ static int janus_streaming_rtsp_play(janus_streaming_rtp_source *source) {
 	return 0;
 }
 
+
+/* Helper to send an RTSP PAUSE */
+static int janus_streaming_rtsp_pause(janus_streaming_rtp_source *source) {
+	if(source == NULL || source->curldata == NULL)
+		return -1;
+	/* Send an RTSP PAUSE */
+	janus_mutex_lock(&source->rtsp_mutex);
+	g_free(source->curldata->buffer);
+	source->curldata->buffer = g_malloc0(1);
+	source->curldata->size = 0;
+	JANUS_LOG(LOG_VERB, "Sending PAUSE request...\n");
+	curl_easy_setopt(source->curl, CURLOPT_RTSP_STREAM_URI, source->rtsp_url);
+	curl_easy_setopt(source->curl, CURLOPT_RANGE, "0.000-");
+	curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_PAUSE);
+	int res = curl_easy_perform(source->curl);
+	if(res != CURLE_OK) {
+		JANUS_LOG(LOG_ERR, "Couldn't send PAUSE request: %s\n", curl_easy_strerror(res));
+		janus_mutex_unlock(&source->rtsp_mutex);
+		return -1;
+	}
+	JANUS_LOG(LOG_VERB, "PAUSE answer:%s\n", source->curldata->buffer);
+	janus_mutex_unlock(&source->rtsp_mutex);
+	return 0;
+}
+
 /* Helper to create an RTSP source */
 janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		uint64_t id, char *name, char *desc,
@@ -3820,19 +3862,19 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 	live_rtsp->codecs.video_rtpmap = dovideo ? (vrtpmap ? g_strdup(vrtpmap) : NULL) : NULL;
 	live_rtsp->codecs.video_fmtp = dovideo ? (vfmtp ? g_strdup(vfmtp) : NULL) : NULL;
 	/* Now connect to the RTSP server */
-	if(janus_streaming_rtsp_connect_to_server(live_rtsp) < 0) {
-		/* Error connecting, get rid of the mountpoint */
-		janus_streaming_mountpoint_free(live_rtsp);
-		janus_mutex_unlock(&mountpoints_mutex);
-		return NULL;
-	}
-	/* Send an RTSP PLAY, now */
-	if(janus_streaming_rtsp_play(live_rtsp_source) < 0) {
-		/* Error trying to play, get rid of the mountpoint */
-		janus_streaming_mountpoint_free(live_rtsp);
-		janus_mutex_unlock(&mountpoints_mutex);
-		return NULL;
-	}
+	// if(janus_streaming_rtsp_connect_to_server(live_rtsp) < 0) {
+	// 	/* Error connecting, get rid of the mountpoint */
+	// 	janus_streaming_mountpoint_free(live_rtsp);
+	// 	janus_mutex_unlock(&mountpoints_mutex);
+	// 	return NULL;
+	// }
+	// /* Send an RTSP PLAY, now */
+	// if(janus_streaming_rtsp_play(live_rtsp_source) < 0) {
+	// 	/* Error trying to play, get rid of the mountpoint */
+	// 	janus_streaming_mountpoint_free(live_rtsp);
+	// 	janus_mutex_unlock(&mountpoints_mutex);
+	// 	return NULL;
+	// }
 	/* Start the thread that will receive the media packets */
 	GError *error = NULL;
 	char tname[16];
@@ -4164,7 +4206,8 @@ static void *janus_streaming_relay_thread(void *data) {
 				continue;
 			}
 			now = janus_get_monotonic_time();
-			if(!source->reconnecting && (now - source->reconnect_timer > 5*G_USEC_PER_SEC)) {
+			//TODO: When we send a PAUSE command to the camera, we will get no more media. And probably the line below will decide to reconnect without the statement if session->paused == FALSE.
+			if(session->paused == FALSE && !source->reconnecting && (now - source->reconnect_timer > 5*G_USEC_PER_SEC)) {
 				/* 5 seconds passed and no media? Assume the RTSP server has gone and schedule a reconnect */
 				JANUS_LOG(LOG_WARN, "[%s] %"SCNi64"s passed with no media, trying to reconnect the RTSP stream\n",
 					name, (now - source->reconnect_timer)/G_USEC_PER_SEC);
@@ -4214,7 +4257,9 @@ static void *janus_streaming_relay_thread(void *data) {
 				if(janus_streaming_rtsp_connect_to_server(mountpoint) < 0) {
 					/* Reconnection failed? Let's try again later */
 					JANUS_LOG(LOG_WARN, "[%s] Reconnection of the RTSP stream failed, trying again in a few seconds...\n", name);
-				} else {
+				}
+				//Tracer: We will send a play command only if "startstream" command was called before.
+				else if(session->paused == FALSE && session->pausing == FALSE && session->stopped == FALSE && session->stopping == FALSE) {
 					/* We're connected, let's send a PLAY */
 					if(janus_streaming_rtsp_play(source) < 0) {
 						/* Error trying to play? Let's try again later */
@@ -4255,6 +4300,9 @@ static void *janus_streaming_relay_thread(void *data) {
 				resfd = curl_easy_perform(source->curl);
 				if(resfd != CURLE_OK) {
 					JANUS_LOG(LOG_ERR, "[%s] Couldn't send GET_PARAMETER request: %s\n", name, curl_easy_strerror(resfd));
+				}else{
+					//Tracer: I added this line. If we pause the camera, we will get no media. So we need to keep reconnect_timer updated.
+					source->reconnect_timer = janus_get_monotonic_time();
 				}
 				janus_mutex_unlock(&source->rtsp_mutex);
 			}
