@@ -142,6 +142,7 @@ rtspiface = network interface IP address or device name to listen on when receiv
 #include <errno.h>
 #include <sys/poll.h>
 #include <sys/time.h>
+#include <gst/gst.h> //To be able to use GStreamer1.0 library
 
 #ifdef HAVE_LIBCURL
 #include <curl/curl.h>
@@ -347,11 +348,24 @@ static gboolean notify_events = TRUE;
 static janus_callbacks *gateway = NULL;
 static GThread *handler_thread;
 static GThread *watchdog;
+static GThread *gstreamer_thread;
 static void *janus_streaming_handler(void *data);
 static void *janus_streaming_ondemand_thread(void *data);
 static void *janus_streaming_filesource_thread(void *data);
 static void janus_streaming_relay_rtp_packet(gpointer data, gpointer user_data);
 static void *janus_streaming_relay_thread(void *data);
+
+static int gstreamerStreamingStatus = 0;
+typedef enum gstreamer_streaming_status {
+	gstreamer_streaming_status_init = 0, //verb, need an action
+	gstreamer_streaming_status_inited, //situation, doesnt need an action
+	gstreamer_streaming_status_start,
+	gstreamer_streaming_status_started,
+	gstreamer_streaming_status_stop,
+	gstreamer_streaming_status_stopped,
+} gstreamer_streaming_status;
+
+static void *gstreamer_streaming_thread(void *data);
 
 typedef enum janus_streaming_type {
 	janus_streaming_type_none = 0,
@@ -521,6 +535,8 @@ static void janus_streaming_message_free(janus_streaming_message *msg) {
 typedef struct janus_streaming_session {
 	janus_plugin_session *handle;
 	janus_streaming_mountpoint *mountpoint;
+	GstElement *gstreamer_pipeline;
+	int gstreamer_status;
 	gboolean started;
 	gboolean paused;
 	gboolean audio, video, data;		/* Whether audio, video and/or data must be sent to this listener */
@@ -629,6 +645,62 @@ static void *janus_streaming_watchdog(void *data) {
 	JANUS_LOG(LOG_INFO, "Streaming watchdog stopped\n");
 	return NULL;
 }
+
+
+#ifdef HAVE_LIBCURL
+
+/* Helper to send an RTSP PLAY (either when we create the mountpoint, or when we try reconnecting) */
+static int janus_streaming_rtsp_play(janus_streaming_rtp_source *source) {
+	if(source == NULL || source->curldata == NULL)
+		return -1;
+	/* Send an RTSP PLAY */
+	janus_mutex_lock(&source->rtsp_mutex);
+	g_free(source->curldata->buffer);
+	source->curldata->buffer = g_malloc0(1);
+	source->curldata->size = 0;
+	JANUS_LOG(LOG_VERB, "Sending PLAY request...\n");
+	curl_easy_setopt(source->curl, CURLOPT_RTSP_STREAM_URI, source->rtsp_url);
+	curl_easy_setopt(source->curl, CURLOPT_RANGE, "0.000-");
+	curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_PLAY);
+	int res = curl_easy_perform(source->curl);
+	if(res != CURLE_OK) {
+		JANUS_LOG(LOG_ERR, "Couldn't send PLAY request: %s\n", curl_easy_strerror(res));
+		janus_mutex_unlock(&source->rtsp_mutex);
+		return -1;
+	}
+	JANUS_LOG(LOG_VERB, "PLAY answer:%s\n", source->curldata->buffer);
+	janus_mutex_unlock(&source->rtsp_mutex);
+	return 0;
+}
+
+
+/* Helper to send an RTSP PAUSE */
+static int janus_streaming_rtsp_pause(janus_streaming_rtp_source *source) {
+	if(source == NULL || source->curldata == NULL)
+		return -1;
+	/* Send an RTSP PAUSE */
+	janus_mutex_lock(&source->rtsp_mutex);
+	g_free(source->curldata->buffer);
+	source->curldata->buffer = g_malloc0(1);
+	source->curldata->size = 0;
+	JANUS_LOG(LOG_VERB, "Sending PAUSE request...\n");
+	curl_easy_setopt(source->curl, CURLOPT_RTSP_STREAM_URI, source->rtsp_url);
+	curl_easy_setopt(source->curl, CURLOPT_RANGE, "0.000-");
+	curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_PAUSE);
+	int res = curl_easy_perform(source->curl);
+	if(res != CURLE_OK) {
+		JANUS_LOG(LOG_ERR, "Couldn't send PAUSE request: %s\n", curl_easy_strerror(res));
+		janus_mutex_unlock(&source->rtsp_mutex);
+		return -1;
+	}
+	JANUS_LOG(LOG_VERB, "PAUSE answer:%s\n", source->curldata->buffer);
+	janus_mutex_unlock(&source->rtsp_mutex);
+	return 0;
+}
+
+#endif
+
+
 
 /* Plugin implementation */
 int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
@@ -1098,6 +1170,14 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 	gateway = callback;
 
 	GError *error = NULL;
+	/* Start the gstreamer_thread */
+	gstreamer_thread = g_thread_try_new("Gstreamer streaming thread", &gstreamer_streaming_thread, NULL, &error);
+	if (!gstreamer_thread) {
+		g_atomic_int_set(&initialized, 0);
+		JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the Gstreamer streaming thread...\n", error->code, error->message ? error->message : "??");
+		janus_config_destroy(config);
+		return -1;
+	}
 	/* Start the sessions watchdog */
 	watchdog = g_thread_try_new("streaming watchdog", &janus_streaming_watchdog, NULL, &error);
 	if(!watchdog) {
@@ -1118,6 +1198,375 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 	return 0;
 }
 
+
+void* gstreamer_init_pipeline_x264enc()
+{
+
+
+//Video elements
+GstElement *pipeline;
+GstElement *sourceVideo;
+GstElement *encoder;
+GstElement *h264parse;
+GstElement *rtppay;
+GstElement *sinkVideo;
+
+//Audio elements
+GstElement *sourceAudio;
+GstElement *audioconvert;
+GstElement *audioresample;
+GstElement *opusenc;
+GstElement *rtpopuspay;
+GstElement *sinkAudio;
+
+	//gst - launch - 1.0 
+	//rpicamsrc 
+	//! video / x - raw, width = 640, height = 480 
+	//! x264enc speed - preset = ultrafast tune = zerolatency byte - stream = true threads = 1 bitrate = 200 
+	//! h264parse config - interval = 1 
+	//! rtph264pay 
+	//! udpsink host = 127.0.0.1 port = 8004 sync = true
+	//alsasrc device = hw:1, 0 
+	//! audioconvert 
+	//! audioresample 
+	//! opusenc bandwidth = 1101 bitrate = 32000 
+	//! rtpopuspay 
+	//! udpsink host = 127.0.0.1 port = 8002 sync = true
+
+
+	/* Initialize GStreamer */
+	gst_init(NULL, NULL);
+
+	/* Create the empty pipeline */
+	pipeline = gst_pipeline_new("pipeline");
+
+	/* Create elements */
+	//Video elements
+	sourceVideo = gst_element_factory_make("rpicamsrc", "rpicamsrc");
+	encoder = gst_element_factory_make("x264enc", "x264enc");
+	h264parse = gst_element_factory_make("h264parse", "h264parse");
+	rtppay = gst_element_factory_make("rtph264pay", "rtph264pay");
+	sinkVideo = gst_element_factory_make("udpsink", "sinkVideo");
+
+	//Audio elements
+	sourceAudio = gst_element_factory_make("alsasrc", "alsasrc");
+	audioconvert = gst_element_factory_make("audioconvert", "audioconvert");
+	audioresample = gst_element_factory_make("audioresample", "audioresample");
+	opusenc = gst_element_factory_make("opusenc", "opusenc");
+	rtpopuspay = gst_element_factory_make("rtpopuspay", "rtpopuspay");
+	sinkAudio = gst_element_factory_make("udpsink", "sinkAudio");
+
+	if (!pipeline || !sourceVideo || !encoder || !h264parse || !rtppay || !sinkVideo || !sourceAudio || !audioconvert || !audioresample || !opusenc || !rtpopuspay || !sinkAudio) {
+		JANUS_LOG(LOG_ERR, "GStreamer; Unable to create GStreamer elements!\n");
+		return;
+	}
+
+	/* Build the pipeline. */
+	gst_bin_add(GST_BIN(pipeline), sourceVideo);
+	gst_bin_add(GST_BIN(pipeline), encoder);
+	gst_bin_add(GST_BIN(pipeline), h264parse);
+
+	gboolean link_ok;
+	GstCaps *caps;
+
+	caps = gst_caps_new_simple("video/x-raw",
+		"width", G_TYPE_INT, 640,
+		"height", G_TYPE_INT, 480,
+		NULL);
+
+	link_ok = gst_element_link_filtered(sourceVideo, encoder, caps);
+	gst_caps_unref(caps);
+
+	if (!link_ok) {
+		JANUS_LOG(LOG_ERR, "GStreamer; Failed to link sourceVideo and encoder!\n");
+	}
+
+	if (!gst_element_link(encoder, h264parse)) {
+		g_printerr("Elements could not be linked. encoder, h264parse\n");
+		gst_object_unref(pipeline);
+		return -1;
+	}
+	if (!gst_element_link(h264parse, rtppay)) {
+		g_printerr("Elements could not be linked. h264parse, rtppay\n");
+		gst_object_unref(pipeline);
+		return -1;
+	}
+	if (!gst_element_link(rtppay, sinkVideo)) {
+		g_printerr("Elements could not be linked. rtppay, sinkVideo\n");
+		gst_object_unref(pipeline);
+		return -1;
+	}
+
+
+
+	if (!gst_element_link(sourceAudio, audioconvert)) {
+		g_printerr("Elements could not be linked. sourceAudio, audioconvert\n");
+		gst_object_unref(pipeline);
+		return -1;
+	}
+	if (!gst_element_link(audioconvert, audioresample)) {
+		g_printerr("Elements could not be linked. audioconvert, audioresample\n");
+		gst_object_unref(pipeline);
+		return -1;
+	}
+	if (!gst_element_link(audioresample, opusenc)) {
+		g_printerr("Elements could not be linked. audioresample, opusenc\n");
+		gst_object_unref(pipeline);
+		return -1;
+	}
+	if (!gst_element_link(opusenc, rtpopuspay)) {
+		g_printerr("Elements could not be linked. opusenc, rtpopuspay\n");
+		gst_object_unref(pipeline);
+		return -1;
+	}
+	if (!gst_element_link(rtpopuspay, sinkAudio)) {
+		g_printerr("Elements could not be linked. rtpopuspay, sinkAudio\n");
+		gst_object_unref(pipeline);
+		return -1;
+	}
+
+
+	/* Set element properties */
+
+	//Video elements
+	//g_object_set(sourceVideo, "awb-mode", 6, NULL);
+	//g_object_set(sourceVideo, "sensor-mode", 6, NULL);
+	g_object_set(encoder, "speed-preset", 1, NULL);
+	g_object_set(encoder, "tune", 4, NULL);
+	//g_object_set(encoder, "key-int-max", 30, NULL);
+	//g_object_set(encoder, "subme", 3, NULL);
+	g_object_set(encoder, "byte-stream", 1, NULL);
+	g_object_set(encoder, "bitrate", 200, NULL);
+	g_object_set(encoder, "threads", 1, NULL);
+	g_object_set(rtppay, "config-interval", 1, NULL);
+	g_object_set(sinkVideo, "host", "127.0.0.1", NULL);
+	g_object_set(sinkVideo, "port", 8004, NULL);
+	g_object_set(sinkVideo, "sync", 1, NULL);
+	//g_object_set(sinkVideo, "async", 0, NULL);
+
+
+	//Audio elements
+	g_object_set(sourceAudio, "device", "hw:1,0", NULL);
+	g_object_set(opusenc, "bandwidth", 1101, NULL);
+	g_object_set(opusenc, "bitrate", 48000, NULL);
+	g_object_set(sinkAudio, "host", "127.0.0.1", NULL);
+	g_object_set(sinkAudio, "port", 8002, NULL);
+	g_object_set(sinkAudio, "sync", 1, NULL);
+
+
+
+}
+
+void* gstreamer_init_pipeline_omxh264enc()
+{
+
+
+//Video elements
+GstElement *pipeline;
+GstElement *sourceVideo;
+GstElement *encoder;
+GstElement *h264parse;
+GstElement *rtppay;
+GstElement *sinkVideo;
+
+//Audio elements
+GstElement *sourceAudio;
+GstElement *audioconvert;
+GstElement *audioresample;
+GstElement *opusenc;
+GstElement *rtpopuspay;
+GstElement *sinkAudio;
+
+
+	//gst - launch - 1.0 
+	//rpicamsrc !video / x - raw, width = 640, height = 480 
+	//! omxh264enc !video / x - h264, width = 640, height = 480, framerate = 30 / 1, profile = baseline 
+	//! rtph264pay config - interval = 1 
+	//! udpsink host = 127.0.0.1 port = 8004 sync = false async = false
+
+
+	//gst - launch - 1.0 
+	//rpicamsrc 
+	//! video / x - raw, width = 640, height = 480 
+	//! x264enc speed - preset = ultrafast tune = zerolatency byte - stream = true threads = 1 bitrate = 200 
+	//! h264parse config - interval = 1 
+	//! rtph264pay !udpsink host = 127.0.0.1 port = 8004 sync = true
+	//alsasrc device = hw:1, 0 
+	//! audioconvert 
+	//! audioresample 
+	//! opusenc bandwidth = 1101 bitrate = 32000 
+	//! rtpopuspay 
+	//! udpsink host = 127.0.0.1 port = 8002 sync = true
+	
+
+
+	/* Initialize GStreamer */
+	gst_init(NULL, NULL);
+
+	/* Create the empty pipeline */
+	pipeline = gst_pipeline_new("pipeline");
+
+	/* Create elements */
+	sourceVideo = gst_element_factory_make("rpicamsrc", "rpicamsrc");
+	encoder = gst_element_factory_make("omxh264enc", "omxh264enc");
+	rtppay = gst_element_factory_make("rtph264pay", "rtph264pay");
+	sinkVideo = gst_element_factory_make("udpsink", "udpsink");
+
+	if (!pipeline || !sourceVideo || !encoder || !rtppay || !sinkVideo) {
+		JANUS_LOG(LOG_ERR, "GStreamer; Unable to create GStreamer elements!\n");
+		return;
+	}
+
+	/* Build the pipeline. */
+	//gst_bin_add_many(GST_BIN(pipeline), sourceVideo, encoder, rtppay, sinkVideo, NULL);
+	/*if (!gst_element_link(sourceVideo, encoder)) {
+	g_printerr("Elements could not be linked. sourceVideo, encoder\n");
+	gst_object_unref(pipeline);
+	return -1;
+	}*/
+
+	gboolean link_ok;
+	GstCaps *caps;
+
+	caps = gst_caps_new_simple("video/x-raw",
+		"width", G_TYPE_INT, 640,
+		"height", G_TYPE_INT, 480,
+		NULL);
+
+	link_ok = gst_element_link_filtered(sourceVideo, encoder, caps);
+	gst_caps_unref(caps);
+
+	if (!link_ok) {
+		JANUS_LOG(LOG_ERR, "GStreamer; Failed to link sourceVideo and encoder!\n");
+	}
+
+
+
+	if (!gst_element_link(encoder, rtppay)) {
+		g_printerr("Elements could not be linked. encoder, rtppay\n");
+		gst_object_unref(pipeline);
+		return -1;
+	}
+	if (!gst_element_link(rtppay, sinkVideo)) {
+		g_printerr("Elements could not be linked. rtppay, sinkVideo\n");
+		gst_object_unref(pipeline);
+		return -1;
+	}
+
+
+	//rpicamsrc inline-headers=true ! video/x-raw,width=640,height=480 ! x264enc speed-preset=ultrafast byte-stream=true bitrate=50 threads=1 ! rtph264pay ! udpsink host=127.0.0.1 port=8004 sync=false async=false
+
+	/* Set element properties */
+
+
+
+
+
+	//g_object_set(sourceVideo, "awb-mode", 6, NULL);
+	//g_object_set(sourceVideo, "caps", "video/x-raw,width=640,height=480", NULL);
+	//g_object_set(sourceVideo, "sensor-mode", 6, NULL);
+	g_object_set(encoder, "speed-preset", 1, NULL);
+	g_object_set(encoder, "tune", 4, NULL);
+	//g_object_set(encoder, "key-int-max", 30, NULL);
+	//g_object_set(encoder, "subme", 3, NULL);
+	g_object_set(encoder, "byte-stream", 1, NULL);
+	g_object_set(encoder, "bitrate", 50, NULL);
+	g_object_set(encoder, "threads", 1, NULL);
+	g_object_set(rtppay, "config-interval", 1, NULL);
+	g_object_set(sinkVideo, "host", "127.0.0.1", NULL);
+	g_object_set(sinkVideo, "port", 8004, NULL);
+	//g_object_set(sinkVideo, "sync", 0, NULL);
+	//g_object_set(sinkVideo, "async", 0, NULL);
+
+
+
+}
+
+
+
+void *gstreamer_streaming_thread(void *data) {
+	JANUS_LOG(LOG_INFO, "GStreamer Streaming thread started\n");
+
+	GstStateChangeReturn ret;
+
+	gst_init(NULL, NULL);
+
+	JANUS_LOG(LOG_INFO, "GStreamer Initialized\n");
+
+	while (g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
+
+					JANUS_LOG(LOG_INFO, "GStreamer; Checking sessionssssss!\n");
+
+		janus_mutex_lock(&sessions_mutex);
+		GHashTableIter iter;
+		gpointer value;
+		g_hash_table_iter_init(&iter, sessions);
+		while(g_hash_table_iter_next(&iter, NULL, &value)) {
+
+					JANUS_LOG(LOG_INFO, "GStreamer; Checking session!\n");
+			janus_streaming_session *session = value;
+			if(session->gstreamer_pipeline == NULL)
+				continue;
+				
+			if (session->gstreamer_status == gstreamer_streaming_status_start)
+			{
+				session->gstreamer_status = gstreamer_streaming_status_started;
+				/* Start playing */
+				ret = gst_element_set_state(session->gstreamer_pipeline, GST_STATE_PLAYING);
+				if (ret == GST_STATE_CHANGE_FAILURE) {
+					JANUS_LOG(LOG_ERR, "GStreamer; Unable to set the pipeline to the playing state.\n");
+					gst_object_unref(session->gstreamer_pipeline);
+					break;
+				}
+				JANUS_LOG(LOG_INFO, "GStreamer Streaming started\n");
+			}
+			else if (session->gstreamer_status == gstreamer_streaming_status_stop)
+			{
+				session->gstreamer_status = gstreamer_streaming_status_stopped;
+				gst_element_set_state(session->gstreamer_pipeline, GST_STATE_PAUSED);
+				JANUS_LOG(LOG_INFO, "GStreamer Streaming stopped\n");
+			}
+			else if (session->gstreamer_status == gstreamer_streaming_status_init)
+			{
+				session->gstreamer_status = gstreamer_streaming_status_inited;
+				gst_element_set_state(session->gstreamer_pipeline, GST_STATE_READY);
+				JANUS_LOG(LOG_INFO, "GStreamer Streaming inited\n");
+			}
+		}
+		janus_mutex_unlock(&sessions_mutex);
+
+		g_usleep(1 * G_USEC_PER_SEC);
+	}
+
+	janus_mutex_lock(&sessions_mutex);
+	GHashTableIter iter;
+	gpointer value;
+	g_hash_table_iter_init(&iter, sessions);
+	while(g_hash_table_iter_next(&iter, NULL, &value)) {
+		janus_streaming_session *session = value;
+
+		session->gstreamer_status = gstreamer_streaming_status_stopped;
+		gst_element_set_state(session->gstreamer_pipeline, GST_STATE_NULL);
+		gst_object_unref(session->gstreamer_pipeline);
+
+	}	
+	janus_mutex_unlock(&sessions_mutex);
+
+	JANUS_LOG(LOG_INFO, "GStreamer destroyed\n");
+}
+
+void start_gstreamer_streaming()
+{
+	if (gstreamerStreamingStatus != gstreamer_streaming_status_started)
+		gstreamerStreamingStatus = gstreamer_streaming_status_start;
+}
+
+void stop_gstreamer_streaming()
+{
+	if (gstreamerStreamingStatus != gstreamer_streaming_status_stopped)
+		gstreamerStreamingStatus = gstreamer_streaming_status_stop;
+}
+
 void janus_streaming_destroy(void) {
 	if(!g_atomic_int_get(&initialized))
 		return;
@@ -1128,6 +1577,10 @@ void janus_streaming_destroy(void) {
 	if(handler_thread != NULL) {
 		g_thread_join(handler_thread);
 		handler_thread = NULL;
+	}
+	if (gstreamer_thread != NULL) {
+		g_thread_join(gstreamer_thread);
+		gstreamer_thread = NULL;
 	}
 
 	/* Remove all mountpoints */
@@ -1211,6 +1664,8 @@ void janus_streaming_create_session(janus_plugin_session *handle, int *error) {
 	g_atomic_int_set(&session->hangingup, 0);
 	handle->plugin_handle = session;
 	janus_mutex_lock(&sessions_mutex);
+	
+	JANUS_LOG(LOG_INFO, "Created new streaming session!\n");
 	g_hash_table_insert(sessions, handle, session);
 	janus_mutex_unlock(&sessions_mutex);
 
@@ -2357,6 +2812,9 @@ void janus_streaming_setup_media(janus_plugin_session *handle) {
 	}
 	if(session->destroyed)
 		return;
+
+	session->gstreamer_status = gstreamer_streaming_status_start;
+
 	g_atomic_int_set(&session->hangingup, 0);
 	/* We only start streaming towards this user when we get this event */
 	janus_rtp_switching_context_reset(&session->context);
@@ -2438,6 +2896,9 @@ void janus_streaming_hangup_media(janus_plugin_session *handle) {
 		return;
 	if(g_atomic_int_add(&session->hangingup, 1))
 		return;
+
+	session->gstreamer_status = gstreamer_streaming_status_stop;
+
 	session->substream = -1;
 	session->substream_target = 0;
 	session->templayer = -1;
@@ -2681,7 +3142,7 @@ static void *janus_streaming_handler(void *data) {
 				//There is a already different mountpoint attach. First stop that stream.
 				JANUS_LOG(LOG_VERB, "We send pause command to previous camera.\n");
 				if(janus_streaming_rtsp_pause((janus_streaming_rtp_source *)session->mountpoint->source) < 0) {
-					JANUS_LOG(LOG_WARN, "[%s] RTSP PAUSE failed, ignoring.\n", name);
+					JANUS_LOG(LOG_WARN, "RTSP PAUSE failed, ignoring.\n");
 				}	
 			}
 
@@ -2711,7 +3172,7 @@ static void *janus_streaming_handler(void *data) {
 				janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)mp->source;
 				if(janus_streaming_rtsp_play(source) < 0) {
 					//TODO: Play command failed. It probably will not try again to send a play command. Do something so it tries again.
-					JANUS_LOG(LOG_WARN, "[%s] RTSP PLAY failed.\n", name);
+					JANUS_LOG(LOG_WARN, "RTSP PLAY failed.\n");
 				}
 			}
 			JANUS_LOG(LOG_VERB, "Starting the streaming\n");
@@ -2725,7 +3186,7 @@ static void *janus_streaming_handler(void *data) {
 			//Send a Pause command to the camera.
 			janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)session->mountpoint->source;
 			if(janus_streaming_rtsp_pause(source) < 0) {
-				JANUS_LOG(LOG_WARN, "[%s] RTSP PAUSE failed, ignoring.\n", name);
+				JANUS_LOG(LOG_WARN, "RTSP PAUSE failed, ignoring.\n");
 			}
 			//Even though camera keeps streaming, this line will prevent stream to be realyed to the driver.
 			session->paused = TRUE;
@@ -3728,55 +4189,6 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 	return 0;
 }
 
-/* Helper to send an RTSP PLAY (either when we create the mountpoint, or when we try reconnecting) */
-static int janus_streaming_rtsp_play(janus_streaming_rtp_source *source) {
-	if(source == NULL || source->curldata == NULL)
-		return -1;
-	/* Send an RTSP PLAY */
-	janus_mutex_lock(&source->rtsp_mutex);
-	g_free(source->curldata->buffer);
-	source->curldata->buffer = g_malloc0(1);
-	source->curldata->size = 0;
-	JANUS_LOG(LOG_VERB, "Sending PLAY request...\n");
-	curl_easy_setopt(source->curl, CURLOPT_RTSP_STREAM_URI, source->rtsp_url);
-	curl_easy_setopt(source->curl, CURLOPT_RANGE, "0.000-");
-	curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_PLAY);
-	int res = curl_easy_perform(source->curl);
-	if(res != CURLE_OK) {
-		JANUS_LOG(LOG_ERR, "Couldn't send PLAY request: %s\n", curl_easy_strerror(res));
-		janus_mutex_unlock(&source->rtsp_mutex);
-		return -1;
-	}
-	JANUS_LOG(LOG_VERB, "PLAY answer:%s\n", source->curldata->buffer);
-	janus_mutex_unlock(&source->rtsp_mutex);
-	return 0;
-}
-
-
-/* Helper to send an RTSP PAUSE */
-static int janus_streaming_rtsp_pause(janus_streaming_rtp_source *source) {
-	if(source == NULL || source->curldata == NULL)
-		return -1;
-	/* Send an RTSP PAUSE */
-	janus_mutex_lock(&source->rtsp_mutex);
-	g_free(source->curldata->buffer);
-	source->curldata->buffer = g_malloc0(1);
-	source->curldata->size = 0;
-	JANUS_LOG(LOG_VERB, "Sending PAUSE request...\n");
-	curl_easy_setopt(source->curl, CURLOPT_RTSP_STREAM_URI, source->rtsp_url);
-	curl_easy_setopt(source->curl, CURLOPT_RANGE, "0.000-");
-	curl_easy_setopt(source->curl, CURLOPT_RTSP_REQUEST, (long)CURL_RTSPREQ_PAUSE);
-	int res = curl_easy_perform(source->curl);
-	if(res != CURLE_OK) {
-		JANUS_LOG(LOG_ERR, "Couldn't send PAUSE request: %s\n", curl_easy_strerror(res));
-		janus_mutex_unlock(&source->rtsp_mutex);
-		return -1;
-	}
-	JANUS_LOG(LOG_VERB, "PAUSE answer:%s\n", source->curldata->buffer);
-	janus_mutex_unlock(&source->rtsp_mutex);
-	return 0;
-}
-
 /* Helper to create an RTSP source */
 janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		uint64_t id, char *name, char *desc,
@@ -4207,7 +4619,7 @@ static void *janus_streaming_relay_thread(void *data) {
 			}
 			now = janus_get_monotonic_time();
 			//TODO: When we send a PAUSE command to the camera, we will get no more media. And probably the line below will decide to reconnect without the statement if session->paused == FALSE.
-			if(session->paused == FALSE && !source->reconnecting && (now - source->reconnect_timer > 5*G_USEC_PER_SEC)) {
+			if(!source->reconnecting && (now - source->reconnect_timer > 5*G_USEC_PER_SEC)) {
 				/* 5 seconds passed and no media? Assume the RTSP server has gone and schedule a reconnect */
 				JANUS_LOG(LOG_WARN, "[%s] %"SCNi64"s passed with no media, trying to reconnect the RTSP stream\n",
 					name, (now - source->reconnect_timer)/G_USEC_PER_SEC);
@@ -4259,7 +4671,7 @@ static void *janus_streaming_relay_thread(void *data) {
 					JANUS_LOG(LOG_WARN, "[%s] Reconnection of the RTSP stream failed, trying again in a few seconds...\n", name);
 				}
 				//Tracer: We will send a play command only if "startstream" command was called before.
-				else if(session->paused == FALSE && session->pausing == FALSE && session->stopped == FALSE && session->stopping == FALSE) {
+				else {
 					/* We're connected, let's send a PLAY */
 					if(janus_streaming_rtsp_play(source) < 0) {
 						/* Error trying to play? Let's try again later */

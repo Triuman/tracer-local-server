@@ -1,5 +1,8 @@
 ACLOCAL_AMFLAGS = -I m4
 
+AM_CPPFLAGS = \
+-pthread -I/usr/include/gstreamer-1.0 -I/usr/lib/x86_64-linux-gnu/gstreamer-1.0/include -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0
+
 # FIXME: These flags should be produced in configure.ac using AX_APPEND_COMPILE_FLAGS
 AM_CFLAGS = \
 	-Wall -Wstrict-prototypes -Wmissing-prototypes -Wmissing-declarations \
@@ -17,7 +20,8 @@ AM_CFLAGS += -Wno-override-init  # we need this for JANUS_PLUGIN_INIT and JANUS_
 # some fairly big refactoring though, which can wait.
 # AM_CFLAGS += -Wshadow -Wstrict-aliasing=2
 
-AM_CFLAGS += -fstack-protector-all -g -ggdb -fPIC -rdynamic -pthread
+AM_CFLAGS += -pthread -I/usr/include/gstreamer-1.0 -I/usr/lib/x86_64-linux-gnu/gstreamer-1.0/include -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 \
+-fstack-protector-all -g -ggdb -fPIC -rdynamic -pthread
 
 # FIXME: make docs work with distcheck
 DISTCHECK_CONFIGURE_FLAGS = --disable-docs --enable-post-processing
