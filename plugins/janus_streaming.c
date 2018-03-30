@@ -406,6 +406,7 @@ typedef struct janus_streaming_rtp_source {
 	janus_recorder *vrc;	/* The Janus recorder instance for this streams's video, if enabled */
 	janus_recorder *drc;	/* The Janus recorder instance for this streams's data, if enabled */
 	janus_mutex rec_mutex;	/* Mutex to protect the recorders from race conditions */
+	char *camera_url;
 	int audio_fd;
 	int video_fd[3];
 	int data_fd;
@@ -488,7 +489,7 @@ static void janus_streaming_mountpoint_free(janus_streaming_mountpoint *mp);
 janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 		uint64_t id, char *name, char *desc,
 		gboolean doaudio, char* amcast, const janus_network_address *aiface, uint16_t aport, uint8_t acodec, char *artpmap, char *afmtp,
-		gboolean dovideo, char* vmcast, const janus_network_address *viface, uint16_t vport, uint8_t vcodec, char *vrtpmap, char *vfmtp, gboolean bufferkf,
+		gboolean dovideo, char* vmcast, const janus_network_address *viface, uint16_t vport, uint8_t vcodec, char *vrtpmap, char *vfmtp, char *camera_url, gboolean bufferkf,
 			gboolean simulcast, uint16_t vport2, uint16_t vport3,
 		gboolean dodata, const janus_network_address *diface, uint16_t dport, gboolean buffermsg);
 /* Helper to create a file/ondemand live source */
@@ -772,6 +773,7 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 				janus_config_item *pin = janus_config_get_item(cat, "pin");
 				janus_config_item *audio = janus_config_get_item(cat, "audio");
 				janus_config_item *video = janus_config_get_item(cat, "video");
+				janus_config_item *camera_url = janus_config_get_item(cat, "camera_url");
 				janus_config_item *data = janus_config_get_item(cat, "data");
 				janus_config_item *diface = janus_config_get_item(cat, "dataiface");
 				janus_config_item *amcast = janus_config_get_item(cat, "audiomcast");
@@ -909,6 +911,7 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 						(vcodec && vcodec->value) ? atoi(vcodec->value) : 0,
 						vrtpmap ? (char *)vrtpmap->value : NULL,
 						vfmtp ? (char *)vfmtp->value : NULL,
+						camera_url ? (char *)camera_url->value : NULL
 						bufferkf,
 						simulcast,
 						(vport2 && vport2->value) ? atoi(vport2->value) : 0,
@@ -1920,6 +1923,7 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 			json_t *audio = json_object_get(root, "audio");
 			json_t *video = json_object_get(root, "video");
 			json_t *data = json_object_get(root, "data");
+			json_t *camera_url = json_object_get(root, "camera_url");
 			gboolean doaudio = audio ? json_is_true(audio) : FALSE;
 			gboolean dovideo = video ? json_is_true(video) : FALSE;
 			gboolean dodata = data ? json_is_true(data) : FALSE;
@@ -2059,9 +2063,9 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 					name ? (char *)json_string_value(name) : NULL,
 					desc ? (char *)json_string_value(desc) : NULL,
 					doaudio, amcast, &audio_iface, aport, acodec, artpmap, afmtp,
-					dovideo, vmcast, &video_iface, vport, vcodec, vrtpmap, vfmtp, bufferkf,
+					dovideo, vmcast, &video_iface, vport, vcodec, vrtpmap, vfmtp, camera_url ? (char *)json_string_value(camera_url) : NULL, bufferkf,
 					simulcast, vport2, vport3,
-					dodata, &data_iface, dport, buffermsg);
+					dodata, &data_iface, dport, buffermsg);	
 			if(mp == NULL) {
 				JANUS_LOG(LOG_ERR, "Error creating 'rtp' stream...\n");
 				error_code = JANUS_STREAMING_ERROR_CANT_CREATE;
@@ -3635,7 +3639,7 @@ static void janus_streaming_mountpoint_free(janus_streaming_mountpoint *mp) {
 janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 		uint64_t id, char *name, char *desc,
 		gboolean doaudio, char *amcast, const janus_network_address *aiface, uint16_t aport, uint8_t acodec, char *artpmap, char *afmtp,
-		gboolean dovideo, char *vmcast, const janus_network_address *viface, uint16_t vport, uint8_t vcodec, char *vrtpmap, char *vfmtp, gboolean bufferkf,
+		gboolean dovideo, char *vmcast, const janus_network_address *viface, uint16_t vport, uint8_t vcodec, char *vrtpmap, char *vfmtp, char *camera_url, gboolean bufferkf,
 			gboolean simulcast, uint16_t vport2, uint16_t vport3,
 		gboolean dodata, const janus_network_address *diface, uint16_t dport, gboolean buffermsg) {
 	janus_mutex_lock(&mountpoints_mutex);
@@ -3794,6 +3798,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 	live_rtp_source->last_received_audio = janus_get_monotonic_time();
 	live_rtp_source->last_received_video = janus_get_monotonic_time();
 	live_rtp_source->last_received_data = janus_get_monotonic_time();
+	live_rtp_source->camera_url = camera_url;
 	live_rtp_source->keyframe.enabled = bufferkf;
 	live_rtp_source->keyframe.latest_keyframe = NULL;
 	live_rtp_source->keyframe.temp_keyframe = NULL;
