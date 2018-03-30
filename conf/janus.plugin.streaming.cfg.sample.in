@@ -64,7 +64,31 @@
 								; handlers (default is yes)
 
 
-;[carid1]
+
+;
+; Firefox Nightly supports H.264 through Cisco's OpenH264 plugin. The only
+; supported profile is the baseline one. This is an example of how to create
+; a H.264 mountpoint: you can feed it an x264enc+rtph264pay pipeline in
+; gstreamer.
+;
+[CarId1]
+type = rtp
+id = 1
+description = H.264 live stream coming from gstreamer
+audio = yes
+video = yes
+audioport = 8002
+audiopt = 111
+audiortpmap = opus/48000/2
+videoport = 8004
+videopt = 126
+videortpmap = H264/90000
+videofmtp = profile-level-id=42e01f\;packetization-mode=1
+camera_url = rtsp://192.168.1.26/live
+
+
+
+;[carid1rtsp]
 ;type = rtsp
 ;id = 1 ;this will be the car id so we can look it up easily
 ;description = Yi 4K+ RTSP
@@ -88,24 +112,6 @@
 ;secret = adminpwd
 
 
-;
-; Firefox Nightly supports H.264 through Cisco's OpenH264 plugin. The only
-; supported profile is the baseline one. This is an example of how to create
-; a H.264 mountpoint: you can feed it an x264enc+rtph264pay pipeline in
-; gstreamer.
-;
-[h264-sample]
-type = rtp
-id = 1
-description = H.264 live stream coming from gstreamer
-audio = yes
-video = yes
-videoport = 8004
-audioport = 8004
-videopt = 126
-videortpmap = H264/90000
-videofmtp = profile-level-id=42e01f\;packetization-mode=1
-camera_url = rtsp://192.168.1.26/live
 
 ;
 ; This is a sample configuration for Opus/VP8 multicast streams
