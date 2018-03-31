@@ -1291,8 +1291,6 @@ void *gstreamer_streaming_thread(void *data) {
 		gpointer value;
 		g_hash_table_iter_init(&iter, sessions);
 		while(g_hash_table_iter_next(&iter, NULL, &value)) {
-
-			JANUS_LOG(LOG_INFO, "GStreamer; Checking session!\n");
 			janus_streaming_session *session = value;
 			if(session->gstreamer_pipeline == NULL)
 				continue;
@@ -2788,7 +2786,7 @@ static void *janus_streaming_handler(void *data) {
 			g_strlcat(sdptemp, buffer, 2048);
 			g_strlcat(sdptemp, "t=0 0\r\n", 2048);
 			
-
+		if (mp->codecs.audio_pt >= 0) {
 			/* Add audio line */
 			g_snprintf(buffer, 512,
 				"m=audio 1 RTP/SAVPF %d\r\n"
@@ -2808,7 +2806,8 @@ static void *janus_streaming_handler(void *data) {
 				g_strlcat(sdptemp, buffer, 2048);
 			}
 			g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
-		
+		}
+		if (mp->codecs.video_pt >= 0) {
 			/* Add video line */
 			g_snprintf(buffer, 512,
 				"m=video 1 RTP/SAVPF %d\r\n"
@@ -2836,7 +2835,7 @@ static void *janus_streaming_handler(void *data) {
 				mp->codecs.video_pt);
 			g_strlcat(sdptemp, buffer, 2048);
 			g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
-			
+		}
 #ifdef HAVE_SCTP
 			
 			/* Add data line */
