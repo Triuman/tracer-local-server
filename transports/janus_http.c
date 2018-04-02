@@ -246,8 +246,8 @@ static void janus_http_random_string(int length, char *buffer) {
 
 /* Helper to create a MHD daemon */
 static struct MHD_Daemon *janus_http_create_daemon(gboolean admin, char *path,
-		const char *interface, const char *ip, int port,
-		gint64 threads, const char *server_pem, const char *server_key) {
+		const char *interface, const char *ip, int port, gint64 threads,
+		const char *server_pem, const char *server_key, const char *password) {
 	struct MHD_Daemon *daemon = NULL;
 	gboolean secure = server_pem && server_key;
 	/* Any interface or IP address we need to limit ourselves to?
@@ -435,6 +435,11 @@ static struct MHD_Daemon *janus_http_create_daemon(gboolean admin, char *path,
 		/* HTTPS web server, read certificate and key */
 		g_file_get_contents(server_pem, &cert_pem_bytes, NULL, NULL);
 		g_file_get_contents(server_key, &cert_key_bytes, NULL, NULL);
+#if MHD_VERSION < 0x00093903
+		if(password) {
+			JANUS_LOG(LOG_WARN, "Passed a certificate/key passphrase, but MHD is older than 0.9.40, ignoring\n");
+		}
+#endif
 
 		/* Start webserver */
 		if(threads == 0) {
@@ -458,6 +463,9 @@ static struct MHD_Daemon *janus_http_create_daemon(gboolean admin, char *path,
 					MHD_OPTION_NOTIFY_COMPLETED, &janus_http_request_completed, NULL,
 					MHD_OPTION_HTTPS_MEM_CERT, cert_pem_bytes,
 					MHD_OPTION_HTTPS_MEM_KEY, cert_key_bytes,
+#if MHD_VERSION >= 0x00093903
+					MHD_OPTION_HTTPS_KEY_PASSWORD, password,
+#endif
 					MHD_OPTION_END);
 			} else {
 				/* Bind to the interface that was specified */
@@ -478,6 +486,9 @@ static struct MHD_Daemon *janus_http_create_daemon(gboolean admin, char *path,
 					MHD_OPTION_NOTIFY_COMPLETED, &janus_http_request_completed, NULL,
 					MHD_OPTION_HTTPS_MEM_CERT, cert_pem_bytes,
 					MHD_OPTION_HTTPS_MEM_KEY, cert_key_bytes,
+#if MHD_VERSION >= 0x00093903
+					MHD_OPTION_HTTPS_KEY_PASSWORD, password,
+#endif
 					MHD_OPTION_SOCK_ADDR, ipv6 ? (struct sockaddr *)&addr6 : (struct sockaddr *)&addr,
 					MHD_OPTION_END);
 			}
@@ -499,6 +510,9 @@ static struct MHD_Daemon *janus_http_create_daemon(gboolean admin, char *path,
 					MHD_OPTION_NOTIFY_COMPLETED, &janus_http_request_completed, NULL,
 					MHD_OPTION_HTTPS_MEM_CERT, cert_pem_bytes,
 					MHD_OPTION_HTTPS_MEM_KEY, cert_key_bytes,
+#if MHD_VERSION >= 0x00093903
+					MHD_OPTION_HTTPS_KEY_PASSWORD, password,
+#endif
 					MHD_OPTION_END);
 			} else {
 				/* Bind to the interface that was specified */
@@ -516,6 +530,9 @@ static struct MHD_Daemon *janus_http_create_daemon(gboolean admin, char *path,
 					MHD_OPTION_NOTIFY_COMPLETED, &janus_http_request_completed, NULL,
 					MHD_OPTION_HTTPS_MEM_CERT, cert_pem_bytes,
 					MHD_OPTION_HTTPS_MEM_KEY, cert_key_bytes,
+#if MHD_VERSION >= 0x00093903
+					MHD_OPTION_HTTPS_KEY_PASSWORD, password,
+#endif
 					MHD_OPTION_SOCK_ADDR, ipv6 ? (struct sockaddr *)&addr6 : (struct sockaddr *)&addr,
 					MHD_OPTION_END);
 			}
@@ -584,6 +601,12 @@ static void janus_http_add_cors_headers(janus_http_msg *msg, struct MHD_Response
 		MHD_add_response_header(response, "Access-Control-Allow-Headers", msg->acrh);
 }
 
+/* Static callback that we register to */
+static void janus_http_mhd_panic(void *cls, const char *file, unsigned int line, const char *reason) {
+	JANUS_LOG(LOG_WARN, "[%s]: Error in GNU libmicrohttpd %s:%u: %s\n",
+		JANUS_REST_PACKAGE, file, line, reason);
+}
+
 /* Transport implementation */
 int janus_http_init(janus_transport_callbacks *callback, const char *config_path) {
 	if(g_atomic_int_get(&stopping)) {
@@ -601,6 +624,9 @@ int janus_http_init(janus_transport_callbacks *callback, const char *config_path
 
 	/* This is the callback we'll need to invoke to contact the gateway */
 	gateway = callback;
+
+	/* Register a function to detect problems for which MHD would typically abort */
+	MHD_set_panic_func(&janus_http_mhd_panic, NULL);
 
 	/* Read configuration */
 	char filename[255];
@@ -747,7 +773,7 @@ int janus_http_init(janus_transport_callbacks *callback, const char *config_path
 			item = janus_config_get_item_drilldown(config, "general", "ip");
 			if(item && item->value)
 				ip = item->value;
-			ws = janus_http_create_daemon(FALSE, ws_path, interface, ip, wsport, threads, NULL, NULL);
+			ws = janus_http_create_daemon(FALSE, ws_path, interface, ip, wsport, threads, NULL, NULL, NULL);
 			if(ws == NULL) {
 				JANUS_LOG(LOG_FATAL, "Couldn't start webserver on port %d...\n", wsport);
 			} else {
@@ -763,6 +789,10 @@ int janus_http_init(janus_transport_callbacks *callback, const char *config_path
 		item = janus_config_get_item_drilldown(config, "certificates", "cert_key");
 		if(item && item->value)
 			server_key = (char *)item->value;
+		char *password = NULL;
+		item = janus_config_get_item_drilldown(config, "certificates", "cert_pwd");
+		if(item && item->value)
+			password = (char *)item->value;
 		if(server_key)
 			JANUS_LOG(LOG_VERB, "Using certificates:\n\t%s\n\t%s\n", server_pem, server_key);
 		item = janus_config_get_item_drilldown(config, "general", "https");
@@ -784,7 +814,7 @@ int janus_http_init(janus_transport_callbacks *callback, const char *config_path
 				item = janus_config_get_item_drilldown(config, "general", "secure_ip");
 				if(item && item->value)
 					ip = item->value;
-				sws = janus_http_create_daemon(FALSE, ws_path, interface, ip, swsport, threads, server_pem, server_key);
+				sws = janus_http_create_daemon(FALSE, ws_path, interface, ip, swsport, threads, server_pem, server_key, password);
 				if(sws == NULL) {
 					JANUS_LOG(LOG_FATAL, "Couldn't start secure webserver on port %d...\n", swsport);
 				} else {
@@ -826,7 +856,7 @@ int janus_http_init(janus_transport_callbacks *callback, const char *config_path
 			item = janus_config_get_item_drilldown(config, "admin", "admin_ip");
 			if(item && item->value)
 				ip = item->value;
-			admin_ws = janus_http_create_daemon(TRUE, admin_ws_path, interface, ip, wsport, threads, NULL, NULL);
+			admin_ws = janus_http_create_daemon(TRUE, admin_ws_path, interface, ip, wsport, threads, NULL, NULL, NULL);
 			if(admin_ws == NULL) {
 				JANUS_LOG(LOG_FATAL, "Couldn't start admin/monitor webserver on port %d...\n", wsport);
 			} else {
@@ -853,7 +883,7 @@ int janus_http_init(janus_transport_callbacks *callback, const char *config_path
 				item = janus_config_get_item_drilldown(config, "admin", "admin_secure_ip");
 				if(item && item->value)
 					ip = item->value;
-				admin_sws = janus_http_create_daemon(TRUE, admin_ws_path, interface, ip, swsport, threads, server_pem, server_key);
+				admin_sws = janus_http_create_daemon(TRUE, admin_ws_path, interface, ip, swsport, threads, server_pem, server_key, password);
 				if(admin_sws == NULL) {
 					JANUS_LOG(LOG_FATAL, "Couldn't start secure admin/monitor webserver on port %d...\n", swsport);
 				} else {
@@ -1036,7 +1066,7 @@ void janus_http_session_created(void *transport, guint64 session_id) {
 		janus_mutex_unlock(&sessions_mutex);
 		return;
 	}
-	janus_http_session *session = g_malloc0(sizeof(janus_http_session));
+	janus_http_session *session = g_malloc(sizeof(janus_http_session));
 	session->events = g_async_queue_new();
 	session->destroyed = 0;
 	g_hash_table_insert(sessions, janus_uint64_dup(session_id), session);
@@ -1122,20 +1152,7 @@ int janus_http_handler(void *cls, struct MHD_Connection *connection, const char 
 		JANUS_LOG(LOG_DBG, "Got a HTTP %s request on %s...\n", method, url);
 		JANUS_LOG(LOG_DBG, " ... Just parsing headers for now...\n");
 		msg = g_malloc0(sizeof(janus_http_msg));
-		if(msg == NULL) {
-			JANUS_LOG(LOG_FATAL, "Memory error!\n");
-			ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
-			MHD_destroy_response(response);
-			goto done;
-		}
 		msg->connection = connection;
-		msg->acrh = NULL;
-		msg->acrm = NULL;
-		msg->payload = NULL;
-		msg->len = 0;
-		msg->session_id = 0;
-		msg->got_response = FALSE;
-		msg->response = NULL;
 		janus_mutex_init(&msg->wait_mutex);
 		janus_condition_init(&msg->wait_cond);
 		janus_mutex_lock(&messages_mutex);
@@ -1183,9 +1200,10 @@ int janus_http_handler(void *cls, struct MHD_Connection *connection, const char 
 			basepath = g_strsplit(url, ws_path, -1);
 		} else {
 			/* The base path is the web server too itself, we process the url itself */
-			basepath = g_malloc0(3);
+			basepath = g_malloc_n(3, sizeof(char *));
 			basepath[0] = g_strdup("/");
 			basepath[1] = g_strdup(url);
+			basepath[2] = NULL;
 		}
 		if(basepath[0] == NULL || basepath[1] == NULL || basepath[1][0] != '/') {
 			JANUS_LOG(LOG_ERR, "Invalid url %s\n", url);
@@ -1218,22 +1236,10 @@ int janus_http_handler(void *cls, struct MHD_Connection *connection, const char 
 	JANUS_LOG(LOG_DBG, " ... parsing request...\n");
 	if(path != NULL && path[1] != NULL && strlen(path[1]) > 0) {
 		session_path = g_strdup(path[1]);
-		if(session_path == NULL) {
-			JANUS_LOG(LOG_FATAL, "Memory error!\n");
-			ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
-			MHD_destroy_response(response);
-			goto done;
-		}
 		JANUS_LOG(LOG_HUGE, "Session: %s\n", session_path);
 	}
 	if(session_path != NULL && path[2] != NULL && strlen(path[2]) > 0) {
 		handle_path = g_strdup(path[2]);
-		if(handle_path == NULL) {
-			JANUS_LOG(LOG_FATAL, "Memory error!\n");
-			ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
-			MHD_destroy_response(response);
-			goto done;
-		}
 		JANUS_LOG(LOG_HUGE, "Handle: %s\n", handle_path);
 	}
 	if(session_path != NULL && handle_path != NULL && path[3] != NULL && strlen(path[3]) > 0) {
@@ -1248,16 +1254,7 @@ int janus_http_handler(void *cls, struct MHD_Connection *connection, const char 
 	if(!strcasecmp(method, "POST")) {
 		JANUS_LOG(LOG_HUGE, "Processing POST data (%s) (%zu bytes)...\n", msg->contenttype, *upload_data_size);
 		if(*upload_data_size != 0) {
-			if(msg->payload == NULL)
-				msg->payload = g_malloc0(*upload_data_size+1);
-			else
-				msg->payload = g_realloc(msg->payload, msg->len+*upload_data_size+1);
-			if(msg->payload == NULL) {
-				JANUS_LOG(LOG_FATAL, "Memory error!\n");
-				ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
-				MHD_destroy_response(response);
-				goto done;
-			}
+			msg->payload = g_realloc(msg->payload, msg->len+*upload_data_size+1);
 			memcpy(msg->payload+msg->len, upload_data, *upload_data_size);
 			msg->len += *upload_data_size;
 			memset(msg->payload + msg->len, '\0', 1);
@@ -1353,7 +1350,7 @@ int janus_http_handler(void *cls, struct MHD_Connection *connection, const char 
 		gateway->incoming_request(&janus_http_transport, msg, (void *)keepalive_id, FALSE, root, NULL);
 		/* Ok, go on */
 		if(handle_path) {
-			char *location = (char *)g_malloc0(strlen(ws_path) + strlen(session_path) + 2);
+			char *location = g_malloc(strlen(ws_path) + strlen(session_path) + 2);
 			g_sprintf(location, "%s/%s", ws_path, session_path);
 			JANUS_LOG(LOG_ERR, "Invalid GET to %s, redirecting to %s\n", url, location);
 			response = MHD_create_response_from_buffer(0, NULL, MHD_RESPMEM_PERSISTENT);
@@ -1492,20 +1489,7 @@ int janus_http_admin_handler(void *cls, struct MHD_Connection *connection, const
 		JANUS_LOG(LOG_VERB, "Got an admin/monitor HTTP %s request on %s...\n", method, url);
 		JANUS_LOG(LOG_DBG, " ... Just parsing headers for now...\n");
 		msg = g_malloc0(sizeof(janus_http_msg));
-		if(msg == NULL) {
-			JANUS_LOG(LOG_FATAL, "Memory error!\n");
-			ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
-			MHD_destroy_response(response);
-			goto done;
-		}
 		msg->connection = connection;
-		msg->acrh = NULL;
-		msg->acrm = NULL;
-		msg->payload = NULL;
-		msg->len = 0;
-		msg->session_id = 0;
-		msg->got_response = FALSE;
-		msg->response = NULL;
 		janus_mutex_init(&msg->wait_mutex);
 		janus_condition_init(&msg->wait_cond);
 		janus_mutex_lock(&messages_mutex);
@@ -1555,9 +1539,10 @@ int janus_http_admin_handler(void *cls, struct MHD_Connection *connection, const
 			basepath = g_strsplit(url, admin_ws_path, -1);
 		} else {
 			/* The base path is the web server too itself, we process the url itself */
-			basepath = g_malloc0(3);
+			basepath = g_malloc_n(3, sizeof(char *));
 			basepath[0] = g_strdup("/");
 			basepath[1] = g_strdup(url);
+			basepath[2] = NULL;
 		}
 		if(basepath[0] == NULL || basepath[1] == NULL || basepath[1][0] != '/') {
 			JANUS_LOG(LOG_ERR, "Invalid url %s\n", url);
@@ -1590,22 +1575,10 @@ int janus_http_admin_handler(void *cls, struct MHD_Connection *connection, const
 	JANUS_LOG(LOG_DBG, " ... parsing request...\n");
 	if(path != NULL && path[1] != NULL && strlen(path[1]) > 0) {
 		session_path = g_strdup(path[1]);
-		if(session_path == NULL) {
-			JANUS_LOG(LOG_FATAL, "Memory error!\n");
-			ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
-			MHD_destroy_response(response);
-			goto done;
-		}
 		JANUS_LOG(LOG_HUGE, "Session: %s\n", session_path);
 	}
 	if(session_path != NULL && path[2] != NULL && strlen(path[2]) > 0) {
 		handle_path = g_strdup(path[2]);
-		if(handle_path == NULL) {
-			JANUS_LOG(LOG_FATAL, "Memory error!\n");
-			ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
-			MHD_destroy_response(response);
-			goto done;
-		}
 		JANUS_LOG(LOG_HUGE, "Handle: %s\n", handle_path);
 	}
 	if(session_path != NULL && handle_path != NULL && path[3] != NULL && strlen(path[3]) > 0) {
@@ -1620,16 +1593,7 @@ int janus_http_admin_handler(void *cls, struct MHD_Connection *connection, const
 	if(!strcasecmp(method, "POST")) {
 		JANUS_LOG(LOG_HUGE, "Processing POST data (%s) (%zu bytes)...\n", msg->contenttype, *upload_data_size);
 		if(*upload_data_size != 0) {
-			if(msg->payload == NULL)
-				msg->payload = g_malloc0(*upload_data_size+1);
-			else
-				msg->payload = g_realloc(msg->payload, msg->len+*upload_data_size+1);
-			if(msg->payload == NULL) {
-				JANUS_LOG(LOG_FATAL, "Memory error!\n");
-				ret = MHD_queue_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
-				MHD_destroy_response(response);
-				goto done;
-			}
+			msg->payload = g_realloc(msg->payload, msg->len+*upload_data_size+1);
 			memcpy(msg->payload+msg->len, upload_data, *upload_data_size);
 			msg->len += *upload_data_size;
 			memset(msg->payload + msg->len, '\0', 1);

@@ -41,7 +41,7 @@ A couple of plugins depend on a few more libraries:
 
 * [Sofia-SIP](http://sofia-sip.sourceforge.net/) (only needed for the SIP plugin)
 * [libopus](http://opus-codec.org/) (only needed for the bridge plugin)
-* [libogg](http://xiph.org/ogg/) (only needed for the voicemail plugin)
+* [libogg](http://xiph.org/ogg/) (needed for the voicemail plugin and/or post-processor)
 * [libcurl](https://curl.haxx.se/libcurl/) (only needed if you are
 interested in RTSP support in the Streaming plugin or in the sample
 Event Handler plugin)
@@ -284,18 +284,16 @@ MacOS as well, there are a few aspects to highlight when doing that.
 
 First of all, you can use `brew` to install most of the dependencies:
 
-	brew tap homebrew/boneyard
-	brew install jansson libnice openssl libusrsctp libmicrohttpd libwebsockets cmake rabbitmq-c sofia-sip opus libogg curl glib pkg-config gengetopt autoconf automake libtool
+	brew install jansson libnice openssl srtp libusrsctp libmicrohttpd libwebsockets cmake rabbitmq-c sofia-sip opus libogg curl glib pkg-config gengetopt autoconf automake libtool
 
-For what concerns `libsrtp`, which needs to be installed manually, just
-pass `/usr/local` as a prefix when configuring, and proceed as normal:
+For what concerns libwebsockets, though, make sure that the installed version
+is higher than `2.4.1`, or you might encounter the problems described in
+[this post](https://groups.google.com/forum/#!topic/meetecho-janus/HsFaEXBz4Cg).
+If `brew` doesn't provide a more recent version, you'll have to install
+the library manually.
 
-	[..]
-	./configure --prefix=/usr/local
-	[..]
-
-Finally, you may need to provide a custom `prefix` and `PKG_CONFIG_PATH`
-when configuring Janus as well:
+Notice that you may need to provide a custom `prefix` and `PKG_CONFIG_PATH`
+when configuring Janus as well, e.g.:
 
 	./configure --prefix=/usr/local/janus PKG_CONFIG_PATH=/usr/local/opt/openssl/lib/pkgconfig
 
@@ -311,7 +309,7 @@ or on the command line:
 
 	<installdir>/bin/janus --help
 
-	janus 0.2.6
+	janus 0.3.1
 
 	Usage: janus [OPTIONS]...
 
@@ -319,6 +317,8 @@ or on the command line:
 	-V, --version                 Print version and exit
 	-b, --daemon                  Launch Janus in background as a daemon
                                   (default=off)
+	-p, --pid-file=path           Open the specified PID file when starting Janus
+                                  (default=none)
 	-N, --disable-stdout          Disable stdout based logging  (default=off)
 	-L, --log-file=path           Log to the specified file (default=stdout only)
 	-i, --interface=ipaddress     Interface to use (will be the public IP)
@@ -327,6 +327,7 @@ or on the command line:
 	-F, --configs-folder=path     Configuration files folder (default=./conf)
 	-c, --cert-pem=filename       DTLS certificate
 	-k, --cert-key=filename       DTLS certificate key
+	-K, --cert-pwd=text           DTLS certificate key passphrase (if needed)
 	-S, --stun-server=filename    STUN server(:port) to use, if needed (e.g.,
 								  gateway behind NAT, default=none)
 	-1, --nat-1-1=ip              Public IP to put in all host candidates,
@@ -345,16 +346,15 @@ or on the command line:
                                   (experimental)  (default=off)
 	-l, --libnice-debug           Whether to enable libnice debugging or not
                                   (default=off)
+	-f, --full-trickle            Do full-trickle instead of half-trickle
+                                  (default=off)
 	-I, --ice-lite                Whether to enable the ICE Lite mode or not
                                   (default=off)
 	-T, --ice-tcp                 Whether to enable ICE-TCP or not (warning: only
                                   works with ICE Lite)
                                   (default=off)
-	-U, --bundle                  Whether to force BUNDLE or not (whether audio,
-                                  video and data will always be bundled)
-                                  (default=off)
-	-u, --rtcp-mux                Whether to force rtcp-mux or not (whether RTP
-                                  and RTCP will always be muxed)  (default=off)
+	-R, --rfc-4588                Whether to enable RFC4588 retransmissions
+                                  support or not  (default=off)
 	-q, --max-nack-queue=number   Maximum size of the NACK queue (in ms) per user
                                   for retransmissions
 	-t, --no-media-timer=number   Time (in s) that should pass with no media
@@ -362,6 +362,9 @@ or on the command line:
                                   notifies you about this
 	-r, --rtp-port-range=min-max  Port range to use for RTP/RTCP (only available
 								  if the installed libnice supports it)
+	-n, --server-name=name        Public name of this Janus instance
+                                  (default=MyJanusInstance)
+	-s, --session-timeout=number  Session timeout value, in seconds (default=60)
 	-d, --debug-level=1-7         Debug/logging level (0=disable debugging,
                                   7=maximum debug level; default=4)
 	-D, --debug-timestamps        Enable debug/logging timestamps  (default=off)
@@ -377,7 +380,7 @@ or on the command line:
 Options passed through the command line have the precedence on those
 specified in the configuration file. To start the gateway, simply run:
 
-	export LD_LIBRARY_PATH=/usr/lib64
+export LD_LIBRARY_PATH=/usr/lib64
 	<installdir>/bin/janus
 
 This will start the gateway, and have it look at the configuration file.
