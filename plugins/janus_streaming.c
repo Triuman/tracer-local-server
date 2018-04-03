@@ -1363,7 +1363,7 @@ void *gstreamer_streaming_thread(void *data) {
 			janus_streaming_session *session = value;
 			if(session->gstreamer_pipeline == NULL)
 				continue;
-				
+			
 			if (session->gstreamer_status == gstreamer_streaming_status_start)
 			{
 				session->gstreamer_status = gstreamer_streaming_status_started;
@@ -2829,13 +2829,13 @@ void janus_streaming_setup_media(janus_plugin_session *handle) {
 		janus_mutex_unlock(&sessions_mutex);
 		return;
 	}
-	session->gstreamer_status = gstreamer_streaming_status_start;
+	//session->gstreamer_status = gstreamer_streaming_status_start;
 	g_atomic_int_set(&session->hangingup, 0);
 	/* We only start streaming towards this user when we get this event */
 	janus_rtp_switching_context_reset(&session->context);
 	/* If this is related to a live RTP mountpoint, any keyframe we can shoot already? */
 	janus_streaming_mountpoint *mountpoint = session->mountpoint;
-	if(mountpoint->streaming_source == janus_streaming_source_rtp) {
+	if(mountpoint != NULL && mountpoint->streaming_source == janus_streaming_source_rtp) {
 		janus_streaming_rtp_source *source = mountpoint->source;
 		if(source->keyframe.enabled) {
 			JANUS_LOG(LOG_HUGE, "Any keyframe to send?\n");
@@ -3054,6 +3054,8 @@ static void *janus_streaming_handler(void *data) {
 				g_snprintf(error_cause, 512, "No such mountpoint/stream %"SCNu64"", id_value);
 				goto error;
 			}
+			session->stopping = FALSE;
+			session->mountpoint = mp;
 
 			/* Let's prepare an offer now, but let's also check if there0s something we need to skip */
 			sdp_type = "offer";	/* We're always going to do the offer ourselves, never answer */
