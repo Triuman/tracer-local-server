@@ -3054,8 +3054,26 @@ static void *janus_streaming_handler(void *data) {
 				g_snprintf(error_cause, 512, "No such mountpoint/stream %"SCNu64"", id_value);
 				goto error;
 			}
+
+			/* Add the user to the list of watchers and we're done */
+			janus_mutex_lock(&mp->mutex);
+			mp->listeners = g_list_append(mp->listeners, session);
+			janus_mutex_unlock(&mp->mutex);
+			session->paused = FALSE;
 			session->stopping = FALSE;
 			session->mountpoint = mp;
+			session->sdp_version = 1;	/* This needs to be increased when it changes */
+			session->sdp_sessid = janus_get_real_time();
+			/* Check what we should offer */
+			session->audio = TRUE;	/* True by default */
+			if(!mp->audio)
+				session->audio = FALSE;	/* ... unless the mountpoint isn't sending any audio */
+			session->video = TRUE;	/* True by default */
+			if(!mp->video)
+				session->video = FALSE;	/* ... unless the mountpoint isn't sending any video */
+			session->data = TRUE;	/* True by default */
+			if(!mp->data)
+				session->data = FALSE;	/* ... unless the mountpoint isn't sending any data */
 
 			/* Let's prepare an offer now, but let's also check if there0s something we need to skip */
 			sdp_type = "offer";	/* We're always going to do the offer ourselves, never answer */
@@ -3124,16 +3142,16 @@ static void *janus_streaming_handler(void *data) {
 			g_strlcat(sdptemp, buffer, 2048);
 			g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
 		}
-#ifdef HAVE_SCTP
+// #ifdef HAVE_SCTP
 			
-			/* Add data line */
-			g_snprintf(buffer, 512,
-				"m=application 1 DTLS/SCTP 5000\r\n"
-				"c=IN IP4 1.1.1.1\r\n"
-				"a=sctpmap:5000 webrtc-datachannel 16\r\n");
-			g_strlcat(sdptemp, buffer, 2048);
+// 			/* Add data line */
+// 			g_snprintf(buffer, 512,
+// 				"m=application 1 DTLS/SCTP 5000\r\n"
+// 				"c=IN IP4 1.1.1.1\r\n"
+// 				"a=sctpmap:5000 webrtc-datachannel 16\r\n");
+// 			g_strlcat(sdptemp, buffer, 2048);
 			
-#endif
+// #endif
          janus_mutex_unlock(&mountpoints_mutex);
 			sdp = g_strdup(sdptemp);
 			JANUS_LOG(LOG_VERB, "Going to offer this SDP:\n%s\n", sdp);
@@ -3141,6 +3159,7 @@ static void *janus_streaming_handler(void *data) {
 			json_object_set_new(result, "status", json_string("preparing"));
 			
 		} else if(!strcasecmp(request_text, "watch")) {
+			JANUS_LOG(LOG_VERB, "WATCH!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n", sdp);
 			JANUS_VALIDATE_JSON_OBJECT(root, watch_parameters,
 				error_code, error_cause, TRUE,
 				JANUS_STREAMING_ERROR_MISSING_ELEMENT, JANUS_STREAMING_ERROR_INVALID_ELEMENT);
@@ -3206,7 +3225,7 @@ static void *janus_streaming_handler(void *data) {
 			session->video = offer_video ? json_is_true(offer_video) : TRUE;	/* True by default */
 			if(!mp->video)
 				session->video = FALSE;	/* ... unless the mountpoint isn't sending any video */
-			session->data = offer_data ? json_is_true(offer_data) : TRUE;	/* True by default */
+			session->data = FALSE;	/* True by default */
 			if(!mp->data)
 				session->data = FALSE;	/* ... unless the mountpoint isn't sending any data */
 			if((!mp->audio || !session->audio) &&
@@ -3298,7 +3317,7 @@ done:
 				}
 				g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
 			}
-			if(mp->codecs.video_pt >= 0 && session->video) {
+			
 				/* Add video line */
 				g_snprintf(buffer, 512,
 					"m=video 1 RTP/SAVPF %d\r\n"
@@ -3326,17 +3345,17 @@ done:
 					mp->codecs.video_pt);
 				g_strlcat(sdptemp, buffer, 2048);
 				g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
-			}
-#ifdef HAVE_SCTP
-			if(mp->data && session->data) {
-				/* Add data line */
-				g_snprintf(buffer, 512,
-					"m=application 1 DTLS/SCTP 5000\r\n"
-					"c=IN IP4 1.1.1.1\r\n"
-					"a=sctpmap:5000 webrtc-datachannel 16\r\n");
-				g_strlcat(sdptemp, buffer, 2048);
-			}
-#endif
+				
+// #ifdef HAVE_SCTP
+// 			if(mp->data && session->data) {
+// 				/* Add data line */
+// 				g_snprintf(buffer, 512,
+// 					"m=application 1 DTLS/SCTP 5000\r\n"
+// 					"c=IN IP4 1.1.1.1\r\n"
+// 					"a=sctpmap:5000 webrtc-datachannel 16\r\n");
+// 				g_strlcat(sdptemp, buffer, 2048);
+// 			}
+// #endif
 			janus_mutex_unlock(&mp->mutex);
 			sdp = g_strdup(sdptemp);
 			JANUS_LOG(LOG_VERB, "Going to %s this SDP:\n%s\n", sdp_type, sdp);
@@ -3375,6 +3394,8 @@ done:
 			JANUS_LOG(LOG_VERB, "Request to watch mountpoint/stream %"SCNu64"\n", id_value);
 			session->stopping = FALSE;
 			session->mountpoint = mp;
+			session->sdp_version = 1;	/* This needs to be increased when it changes */
+			session->sdp_sessid = janus_get_real_time();
 			/* Check what we should offer */
 			session->audio = TRUE;	/* True by default */
 			session->video = TRUE;	/* True by default */

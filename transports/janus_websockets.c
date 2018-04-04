@@ -1419,7 +1419,7 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
             json_object_set_new(request, "janus", json_string("message"));
             json_object_set_new(request, "transaction", json_string(driver->id));
             json_t *body = json_object();
-            json_object_set_new(body, "request", json_string("connect"));
+            json_object_set_new(body, "request", json_string("watch"));
             json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
             json_object_set_new(request, "body", body);
             json_object_set_new(request, "session_id", json_integer(tracer_session_id));
@@ -2343,6 +2343,138 @@ static int janus_websockets_common_callback(
             // JANUS_LOG(LOG_INFO, "Sending Start Stream command to the Camera\n");
 
             // goto send_message;
+        }
+        else if (!strcasecmp(command_text, "watch"))
+        {
+            //Call attach to create new handle
+            //{"janus":"attach","plugin":"janus.plugin.streaming","transaction":"wv662x7enjVe","force-bundle":true,"force-rtcp-mux":true}
+            //Prepare 'connect' command and send it to streaming plugin through gateway.
+            //{"janus":"message", "body" : {"request":"watch", "id" : 2}, "transaction" : "EtKVfSvaJYrU"}
+
+            //Check if there is a driver with the given ID. If so, just send a webrtcup message to web server.
+            json_t *newdriverid = json_object_get(root, "id");
+            if (!newdriverid)
+            {
+                JANUS_LOG(LOG_ERR, "There is no driver ID in the connecttodriver request.\n");
+                return 0;
+            }
+            const char *newDriverId = json_string_value(newdriverid);
+
+            driver = tracer_find_driver(newDriverId);
+            if (driver == NULL){
+                driver = g_malloc0(sizeof(tracer_driver));
+                janus_mutex_init(&driver->mutex);
+                driver->id = (char *)newDriverId;
+                driver->car = NULL;
+                janus_mutex_lock(&tracer_driver_list_mutex);
+                tracer_driver_list = g_list_append(tracer_driver_list, driver);
+                janus_mutex_unlock(&tracer_driver_list_mutex);
+                JANUS_LOG(LOG_INFO, "New driver added to the list : %s\n", newDriverId);
+            }
+
+            if (driver->is_online)
+            {
+                json_t *info = json_object();
+                json_object_set_new(info, "info", json_string("webrtcup"));
+                json_object_set_new(info, "driverid", json_string(driver->id));
+
+                janus_mutex_lock(&tracer_webserver_ws_client->mutex);
+                janus_mutex_lock(&old_wss_mutex);
+                //Send info to web server
+                /* Convert to string and enqueue */
+                char *payload = json_dumps(info, json_format);
+                g_async_queue_push(tracer_webserver_ws_client->messages, payload);
+                lws_callback_on_writable(tracer_webserver_ws_client->wsi);
+                janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
+                janus_mutex_unlock(&old_wss_mutex);
+                json_decref(info);
+                json_decref(message);
+                return 0;
+            }
+            else
+            {
+                if (driver->handle_id)
+                {
+                    //We only send a connect message to plugin.
+                    message = json_object();
+                    json_object_set_new(message, "janus", json_string("message"));
+                    json_object_set_new(message, "transaction", json_string(driver->id));
+                    json_t *body = json_object();
+                    json_object_set_new(body, "request", json_string("watch"));
+                    json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
+                    json_object_set_new(message, "body", body);
+                    json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                    json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+                }
+                else
+                {
+                    message = json_object();
+                    json_object_set_new(message, "janus", json_string("attach"));
+                    json_object_set_new(message, "plugin", json_string("janus.plugin.streaming"));
+                    json_object_set_new(message, "transaction", json_string(driver->id));
+                    json_object_set_new(message, "force-bundle", json_true());
+                    json_object_set_new(message, "force-rtcp-mux", json_true());
+                    json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+
+                }
+
+                goto send_message;
+            }
+
+        }
+        else if (!strcasecmp(command_text, "startrecording"))
+        {
+            //#############################################################
+            //REMOVE HERE
+
+            //Send startstream message to plugin
+            message = json_object();
+            json_object_set_new(message, "janus", json_string("message"));
+            json_object_set_new(message, "transaction", json_string(driver->id));
+            json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_t *body = json_object();
+            json_object_set_new(body, "request", json_string("recording"));
+            json_object_set_new(body, "action", json_string("start"));
+            json_object_set_new(body, "video", json_string("/tmp/video.mjr"));
+            json_object_set_new(body, "id", json_integer(1));
+            json_object_set_new(message, "body", body);
+
+            JANUS_LOG(LOG_INFO, "Starting to recording!\n");
+
+            goto send_message;
+
+            //REMOVE HERE
+            //#############################################################
+
+
+        }
+        else if (!strcasecmp(command_text, "stoprecording"))
+        {
+            //#############################################################
+            //REMOVE HERE
+
+            //Send startstream message to plugin
+            message = json_object();
+            json_object_set_new(message, "janus", json_string("message"));
+            json_object_set_new(message, "transaction", json_string(driver->id));
+            json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_t *body = json_object();
+            json_object_set_new(body, "request", json_string("recording"));
+            json_object_set_new(body, "action", json_string("stop"));
+            json_object_set_new(body, "video", json_true());
+            json_object_set_new(body, "id", json_integer(1));
+            json_object_set_new(message, "body", body);
+
+            JANUS_LOG(LOG_INFO, "Stopping to recording!\n");
+
+            goto send_message;
+
+            //REMOVE HERE
+            //#############################################################
+
+
         }
         else if (!strcasecmp(command_text, "startstreamandcontrol"))
         {

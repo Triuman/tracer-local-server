@@ -97,7 +97,7 @@ video = yes
 audioport = 8002
 audiopt = 97
 videoport = 8004
-videopt = 126
+videopt = 96
 videortpmap = H264/90000
 videofmtp = profile-level-id=42e01f\;packetization-mode=1
 camera_url = rtsp://192.168.1.26/live
