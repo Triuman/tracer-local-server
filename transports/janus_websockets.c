@@ -2156,7 +2156,6 @@ static int janus_websockets_common_callback(
                     JANUS_LOG(LOG_INFO, "We connect driver(%s) to car(%d)\n", driver_id_string, car->id);\
                 }
             }
-            return;
         }
         else if (!strcasecmp(command_text, "startrace"))
         {
@@ -2543,7 +2542,7 @@ static int janus_websockets_common_callback(
             if (driver->car == NULL)
             {
                 //TODO: Tell Web server that this driver has no car yet.
-                return;
+                return 0;
             }
 
             //Send stop message to the plugin
@@ -2563,7 +2562,7 @@ static int janus_websockets_common_callback(
         else if (!strcasecmp(command_text, "setdriverofcar"))
         {
             if(car == NULL || driver == NULL)
-                return;
+                return 0;
 
             if (car->driver != NULL)
             {
@@ -2633,7 +2632,7 @@ static int janus_websockets_common_callback(
         else if (!strcasecmp(command_text, "controlcar"))
         {
             if(car == NULL)
-                return;
+                return 0;
                    
             //Send speed and steering values to the car
             const char *throttle_str = "50";
@@ -2723,6 +2722,7 @@ static int janus_websockets_common_callback(
 
         if (message != NULL)
         {
+            JANUS_LOG(LOG_INFO, "Sending message to Janus Core");
             gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, &error);
         }
 
