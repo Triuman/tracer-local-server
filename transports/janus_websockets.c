@@ -284,7 +284,8 @@ typedef struct tracer_driver
     struct tracer_car *car;  //The car driver is controlling and most likely also streming. The game may let a driver stream other drivers' cars.
     gboolean is_online;      //if driver disconnect, we do not remove it from the list. We set is_online FALSE and wait him to come back.
     gboolean is_controlling; //If FALSE, we dont rely driver's commands to the car.
-    guint64 handle_id;
+    guint64 handle_id_left;
+    guint64 handle_id_right;
     janus_mutex mutex; /* Mutex to lock/unlock this session */
 } tracer_driver;
 
@@ -359,8 +360,19 @@ static void tracer_stop_all_streams(char *race_id)
             json_object_set_new(message, "janus", json_string("message"));
             json_object_set_new(message, "transaction", json_string(driver->id));
             json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
             json_t *body = json_object();
+            json_object_set_new(body, "request", json_string("stop"));
+            json_object_set_new(message, "body", body);
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+
+            //Send stop message to plugin
+            message = json_object();
+            json_object_set_new(message, "janus", json_string("message"));
+            json_object_set_new(message, "transaction", json_string(driver->id));
+            json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+            body = json_object();
             json_object_set_new(body, "request", json_string("stop"));
             json_object_set_new(message, "body", body);
             gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
@@ -487,7 +499,7 @@ tracer_driver *tracer_find_driver_by_handle_id(guint64 handle_id)
     while (tmp_driver_list != NULL)
     {
         driver = (tracer_driver *)tmp_driver_list->data;
-        if (driver->handle_id == handle_id)
+        if (driver->handle_id_left == handle_id || driver->handle_id_right == handle_id)
         {
             break;
         }
@@ -587,7 +599,7 @@ void *tracer_race_thread(void *data)
                 car = (tracer_car *)tmp_car_list->data;
                 if (car && car->driver)
                 {
-                    driver_handle_ids[driver_handle_id_index++] = car->driver->handle_id;
+                    driver_handle_ids[driver_handle_id_index++] = car->driver->handle_id_left;
 
                     json_t *update = json_object();
                     json_object_set_new(update, "driver_id", json_string(car->driver->id));
@@ -1378,6 +1390,12 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
             json_object_set_new(info, "info", json_string("offer"));
             json_object_set_new(info, "driverid", json_string(driver->id));
             json_object_set_new(info, "sdp", sdp);
+            //Send also if this is offer for left or right.
+            if(handle_id == driver->handle_id_left){
+                json_object_set_new(info, "isleft", json_true());
+            }else{
+                json_object_set_new(info, "isleft", json_false());
+            }
 
             goto send_info;
         }
@@ -1406,11 +1424,27 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
             if (driver == NULL)
             {
                 janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
-					return -1;
-				}
-				driver->handle_id = handle_id;
-
-            JANUS_LOG(LOG_INFO, "Driver '%s' got a handle id : %" SCNu64 "\n", driver->id, driver->handle_id);
+                return -1;
+            }
+            //If left handle id is not given yet, we got the left one. We will ask for another attachment for right handle id.
+            if(!(driver->handle_id_left > 0)){
+                driver->handle_id_left = handle_id;
+                JANUS_LOG(LOG_INFO, "Driver '%s' got LEFT handle id : %" SCNu64 "\n", driver->id, handle_id);
+                //Send another attach request.
+                json_t *request = json_object();
+                json_object_set_new(request, "janus", json_string("attach"));
+                json_object_set_new(request, "plugin", json_string("janus.plugin.streaming"));
+                json_object_set_new(request, "transaction", json_string(driver->id));
+                json_object_set_new(request, "force-bundle", json_true());
+                json_object_set_new(request, "force-rtcp-mux", json_true());
+                json_object_set_new(request, "session_id", json_integer(tracer_session_id));
+                gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, request, NULL);
+                request = NULL;
+            }else{
+                //We got the right and last handle id.
+                driver->handle_id_right = handle_id;
+                JANUS_LOG(LOG_INFO, "Driver '%s' got RIGHT handle id : %" SCNu64 "\n", driver->id, handle_id);
+            }
 
             json_decref(message);
 
@@ -1420,10 +1454,10 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
             json_object_set_new(request, "transaction", json_string(driver->id));
             json_t *body = json_object();
             json_object_set_new(body, "request", json_string("watch"));
-            json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
+            json_object_set_new(body, "id", json_integer(1)); //Just to get some info about mountpoint to create SDP.
             json_object_set_new(request, "body", body);
             json_object_set_new(request, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(request, "handle_id", json_integer(driver->handle_id));
+            json_object_set_new(request, "handle_id", json_integer(handle_id));
 
             gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, 0, request, NULL);
             janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
@@ -1669,7 +1703,7 @@ void tracer_on_race_finish(tracer_race *race)
         car = (tracer_car *)tmp_car_list->data;
         if (car && car->driver)
         {
-            driver_handle_ids[driver_handle_id_index++] = car->driver->handle_id;
+            driver_handle_ids[driver_handle_id_index++] = car->driver->handle_id_left;
 
             json_t *ranking_item = json_object();
             json_object_set_new(ranking_item, "driver_id", json_string(car->driver->id));
@@ -1741,7 +1775,7 @@ void tracer_on_race_abort(tracer_race *race)
             json_object_set_new(body, "webrtc_message", json_string(payload));
             json_object_set_new(request, "body", body);
             json_object_set_new(request, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(request, "handle_id", json_integer(car->driver->handle_id));
+            json_object_set_new(request, "handle_id", json_integer(car->driver->handle_id_left));
             gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, request, NULL);
 
             //TODO: We may need to put a sleep here since we close Webrtc connection just after sending a message.
@@ -1751,7 +1785,14 @@ void tracer_on_race_abort(tracer_race *race)
             json_object_set_new(request, "janus", json_string("hangup"));
             json_object_set_new(request, "transaction", json_string("race_aborted"));
             json_object_set_new(request, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(request, "handle_id", json_integer(car->driver->handle_id));
+            json_object_set_new(request, "handle_id", json_integer(car->driver->handle_id_left));
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, request, NULL);
+
+            request = json_object();
+            json_object_set_new(request, "janus", json_string("hangup"));
+            json_object_set_new(request, "transaction", json_string("race_aborted"));
+            json_object_set_new(request, "session_id", json_integer(tracer_session_id));
+            json_object_set_new(request, "handle_id", json_integer(car->driver->handle_id_right));
             gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, request, NULL);
         }
         tmp_car_list = tmp_car_list->next;
@@ -2123,7 +2164,7 @@ static int janus_websockets_common_callback(
                     janus_mutex_unlock(&tracer_driver_list_mutex);
                     JANUS_LOG(LOG_INFO, "New driver added to the list : %s\n", driver_id);
                 }
-                if (driver->handle_id == NULL)
+                if (driver->handle_id_left == NULL)
                 {
                     message = json_object();
                     json_object_set_new(message, "janus", json_string("attach"));
@@ -2245,7 +2286,7 @@ static int janus_websockets_common_callback(
             }
             else
             {
-                if (driver->handle_id)
+                if (driver->handle_id_right)
                 {
                     //We only send a connect message to plugin.
                     message = json_object();
@@ -2256,7 +2297,20 @@ static int janus_websockets_common_callback(
                     json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
                     json_object_set_new(message, "body", body);
                     json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-                    json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+                    json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
+                    gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+
+                    message = json_object();
+                    json_object_set_new(message, "janus", json_string("message"));
+                    json_object_set_new(message, "transaction", json_string(driver->id));
+                    json_t *body = json_object();
+                    json_object_set_new(body, "request", json_string("connect"));
+                    json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
+                    json_object_set_new(message, "body", body);
+                    json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                    json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+                    gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+                    message = NULL;
                 }
                 else
                 {
@@ -2280,7 +2334,16 @@ static int janus_websockets_common_callback(
             json_object_set_new(message, "janus", json_string("hangup"));
             json_object_set_new(message, "transaction", json_string(driver->id));
             json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+            
+            message = json_object();
+            json_object_set_new(message, "janus", json_string("hangup"));
+            json_object_set_new(message, "transaction", json_string(driver->id));
+            json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+            message = NULL;
 
             //Remove driver from the list
             tracer_remove_driver(driver->id);
@@ -2297,11 +2360,24 @@ static int janus_websockets_common_callback(
             json_object_set_new(message, "janus", json_string("message"));
             json_object_set_new(message, "transaction", json_string(driver->id));
             json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
             json_t *body = json_object();
             json_object_set_new(body, "request", json_string("startstream"));
             json_object_set_new(body, "id", json_integer(1));
             json_object_set_new(message, "body", body);
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+            
+            message = json_object();
+            json_object_set_new(message, "janus", json_string("message"));
+            json_object_set_new(message, "transaction", json_string(driver->id));
+            json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+            json_t *body = json_object();
+            json_object_set_new(body, "request", json_string("startstream"));
+            json_object_set_new(body, "id", json_integer(1));
+            json_object_set_new(message, "body", body);
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+            message = NULL;
 
             JANUS_LOG(LOG_INFO, "Sending Start Stream command to the Camera\n");
 
@@ -2392,7 +2468,7 @@ static int janus_websockets_common_callback(
             }
             else
             {
-                if (driver->handle_id)
+                if (driver->handle_id_right)
                 {
                     //We only send a connect message to plugin.
                     message = json_object();
@@ -2403,7 +2479,20 @@ static int janus_websockets_common_callback(
                     json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
                     json_object_set_new(message, "body", body);
                     json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-                    json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+                    json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
+                    gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+
+                    message = json_object();
+                    json_object_set_new(message, "janus", json_string("message"));
+                    json_object_set_new(message, "transaction", json_string(driver->id));
+                    json_t *body = json_object();
+                    json_object_set_new(body, "request", json_string("watch"));
+                    json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
+                    json_object_set_new(message, "body", body);
+                    json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                    json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+                    gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+                    message = NULL;
                 }
                 else
                 {
@@ -2431,7 +2520,7 @@ static int janus_websockets_common_callback(
             json_object_set_new(message, "janus", json_string("message"));
             json_object_set_new(message, "transaction", json_string(driver->id));
             json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
             json_t *body = json_object();
             json_object_set_new(body, "request", json_string("recording"));
             json_object_set_new(body, "action", json_string("start"));
@@ -2458,7 +2547,7 @@ static int janus_websockets_common_callback(
             json_object_set_new(message, "janus", json_string("message"));
             json_object_set_new(message, "transaction", json_string(driver->id));
             json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
             json_t *body = json_object();
             json_object_set_new(body, "request", json_string("recording"));
             json_object_set_new(body, "action", json_string("stop"));
@@ -2499,11 +2588,24 @@ static int janus_websockets_common_callback(
             json_object_set_new(message, "janus", json_string("message"));
             json_object_set_new(message, "transaction", json_string(driver->id));
             json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
             json_t *body = json_object();
             json_object_set_new(body, "request", json_string("startstream"));
             json_object_set_new(body, "id", json_integer(driver->car->stream_id));
             json_object_set_new(message, "body", body);
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+            
+            message = json_object();
+            json_object_set_new(message, "janus", json_string("message"));
+            json_object_set_new(message, "transaction", json_string(driver->id));
+            json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+            json_t *body = json_object();
+            json_object_set_new(body, "request", json_string("startstream"));
+            json_object_set_new(body, "id", json_integer(driver->car->stream_id));
+            json_object_set_new(message, "body", body);
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+            message = NULL;
 
             JANUS_LOG(LOG_INFO, "Sending Start Stream command to the Camera\n");
 
@@ -2525,10 +2627,22 @@ static int janus_websockets_common_callback(
             json_object_set_new(message, "janus", json_string("message"));
             json_object_set_new(message, "transaction", json_string(driver->id));
             json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
             json_t *body = json_object();
             json_object_set_new(body, "request", json_string("stopstream"));
             json_object_set_new(message, "body", body);
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+            
+            message = json_object();
+            json_object_set_new(message, "janus", json_string("message"));
+            json_object_set_new(message, "transaction", json_string(driver->id));
+            json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+            json_t *body = json_object();
+            json_object_set_new(body, "request", json_string("stopstream"));
+            json_object_set_new(message, "body", body);
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+            message = NULL;
 
             JANUS_LOG(LOG_INFO, "Sending Stop Stream command to the Camera\n");
 
@@ -2550,10 +2664,22 @@ static int janus_websockets_common_callback(
             json_object_set_new(message, "janus", json_string("message"));
             json_object_set_new(message, "transaction", json_string(driver->id));
             json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
             json_t *body = json_object();
             json_object_set_new(body, "request", json_string("stopstream"));
             json_object_set_new(message, "body", body);
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+
+            message = json_object();
+            json_object_set_new(message, "janus", json_string("message"));
+            json_object_set_new(message, "transaction", json_string(driver->id));
+            json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+            json_t *body = json_object();
+            json_object_set_new(body, "request", json_string("stopstream"));
+            json_object_set_new(message, "body", body);
+            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+            message = NULL;
 
             JANUS_LOG(LOG_INFO, "Sending Pause Stream command to the Camera\n");
 
@@ -2574,12 +2700,21 @@ static int janus_websockets_common_callback(
                 json_object_set_new(message, "janus", json_string("message"));
                 json_object_set_new(message, "transaction", json_string(car->driver->id));
                 json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-                json_object_set_new(message, "handle_id", json_integer(car->driver->handle_id));
+                json_object_set_new(message, "handle_id", json_integer(car->driver->handle_id_left));
                 json_t *body = json_object();
                 json_object_set_new(body, "request", json_string("stopstream"));
                 json_object_set_new(message, "body", body);
+                gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
 
-                gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, &error);
+                message = json_object();
+                json_object_set_new(message, "janus", json_string("message"));
+                json_object_set_new(message, "transaction", json_string(car->driver->id));
+                json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                json_object_set_new(message, "handle_id", json_integer(car->driver->handle_id_right));
+                json_t *body = json_object();
+                json_object_set_new(body, "request", json_string("stopstream"));
+                json_object_set_new(message, "body", body);
+                gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
                 message = NULL;
             }
             if (driver->car != NULL)
@@ -2592,12 +2727,21 @@ static int janus_websockets_common_callback(
                 json_object_set_new(message, "janus", json_string("message"));
                 json_object_set_new(message, "transaction", json_string(car->driver->id));
                 json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-                json_object_set_new(message, "handle_id", json_integer(car->driver->handle_id));
+                json_object_set_new(message, "handle_id", json_integer(car->driver->handle_id_left));
                 json_t *body = json_object();
                 json_object_set_new(body, "request", json_string("stopstream"));
                 json_object_set_new(message, "body", body);
-
-                gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, &error);
+                gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
+                
+                message = json_object();
+                json_object_set_new(message, "janus", json_string("message"));
+                json_object_set_new(message, "transaction", json_string(car->driver->id));
+                json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                json_object_set_new(message, "handle_id", json_integer(car->driver->handle_id_right));
+                json_t *body = json_object();
+                json_object_set_new(body, "request", json_string("stopstream"));
+                json_object_set_new(message, "body", body);
+                gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, FALSE, message, NULL);
                 message = NULL;
             }
             //Set car's owner
@@ -2651,7 +2795,7 @@ static int janus_websockets_common_callback(
         }
         else if (!strcasecmp(command_text, "setstreamurl"))
         {
-
+            //TODO: Fix this for two cameras.
             json_t *url = json_object_get(root, "url");
             if (!url)
             {
@@ -2665,7 +2809,7 @@ static int janus_websockets_common_callback(
             json_object_set_new(message, "janus", json_string("message"));
             json_object_set_new(message, "transaction", json_string(driver->id));
             json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
+            json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
             json_t *body = json_object();
             json_object_set_new(body, "request", json_string("create"));
             json_object_set_new(body, "type", json_string("rtsp"));
@@ -2685,17 +2829,30 @@ static int janus_websockets_common_callback(
         {
             //Send answer to Janus Core
             json_t *answersdp = json_object_get(root, "answersdp");
+            json_t *isleft = json_object_get(root, "isleft");
 
             //{"janus":"message","body":{"request":"start"},"transaction":"765EejXJtvRi","jsep":{"type":"answer","sdp":""}}
-            message = json_object();
-            json_object_set_new(message, "janus", json_string("message"));
-            json_object_set_new(message, "transaction", json_string(driver->id));
-            json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
-            json_t *body = json_object();
-            json_object_set_new(body, "request", json_string("acceptanswer")); //Normally, answer comes with a "start" request. Check if it works without any request.
-            json_object_set_new(message, "body", body);
-            json_object_set_new(message, "jsep", answersdp);
+            if(isleft == json_true()){
+                message = json_object();
+                json_object_set_new(message, "janus", json_string("message"));
+                json_object_set_new(message, "transaction", json_string(driver->id));
+                json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
+                json_t *body = json_object();
+                json_object_set_new(body, "request", json_string("acceptanswer")); //Normally, answer comes with a "start" request. Check if it works without any request.
+                json_object_set_new(message, "body", body);
+                json_object_set_new(message, "jsep", answersdp);
+            }else{
+                message = json_object();
+                json_object_set_new(message, "janus", json_string("message"));
+                json_object_set_new(message, "transaction", json_string(driver->id));
+                json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+                json_t *body = json_object();
+                json_object_set_new(body, "request", json_string("acceptanswer")); //Normally, answer comes with a "start" request. Check if it works without any request.
+                json_object_set_new(message, "body", body);
+                json_object_set_new(message, "jsep", answersdp);
+            }
 
             goto send_message;
         }
@@ -2703,17 +2860,30 @@ static int janus_websockets_common_callback(
         {
             //Send answer to Janus Core
             json_t *candidate = json_object_get(root, "candidate");
+            json_t *isleft = json_object_get(root, "isleft");
 
             //{"janus":"message","body":{"request":"start"},"transaction":"765EejXJtvRi","jsep":{"type":"answer","sdp":""}}
-            message = json_object();
-            json_object_set_new(message, "janus", json_string("trickle"));
-            json_object_set_new(message, "transaction", json_string(driver->id));
-            json_object_set_new(message, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(message, "handle_id", json_integer(driver->handle_id));
-            json_t *body = json_object();
-            json_object_set_new(body, "request", json_string("acceptanswer")); //Normally, answer comes with a "start" request. It works like this too. acceptanswer is an empty method in streaming plugin.
-            json_object_set_new(message, "body", body);
-            json_object_set_new(message, "candidate", candidate);
+            if(isleft == json_true()){
+                message = json_object();
+                json_object_set_new(message, "janus", json_string("trickle"));
+                json_object_set_new(message, "transaction", json_string(driver->id));
+                json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
+                json_t *body = json_object();
+                json_object_set_new(body, "request", json_string("acceptanswer")); //Normally, answer comes with a "start" request. It works like this too. acceptanswer is an empty method in streaming plugin.
+                json_object_set_new(message, "body", body);
+                json_object_set_new(message, "candidate", candidate);
+            }else{
+                message = json_object();
+                json_object_set_new(message, "janus", json_string("trickle"));
+                json_object_set_new(message, "transaction", json_string(driver->id));
+                json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+                json_t *body = json_object();
+                json_object_set_new(body, "request", json_string("acceptanswer")); //Normally, answer comes with a "start" request. It works like this too. acceptanswer is an empty method in streaming plugin.
+                json_object_set_new(message, "body", body);
+                json_object_set_new(message, "candidate", candidate);
+            }
 
             goto send_message;
         }
