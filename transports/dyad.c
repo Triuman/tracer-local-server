@@ -710,24 +710,24 @@ void dyad_update(void) {
     stream = stream->next;
   }
 
-  /* Init timeout value and do select */
-  #ifdef _MSC_VER
-    #pragma warning(push)
-    /* Disable double to long implicit conversion warning,
-     * because the type of timeval's fields don't agree across platforms */
-    #pragma warning(disable: 4244)
-  #endif
-  tv.tv_sec = dyad_updateTimeout;
-  tv.tv_usec = (dyad_updateTimeout - tv.tv_sec) * 1e6;
-  #ifdef _MSC_VER
-    #pragma warning(pop)
-  #endif
+  // /* Init timeout value and do select */
+  // #ifdef _MSC_VER
+  //   #pragma warning(push)
+  //   /* Disable double to long implicit conversion warning,
+  //    * because the type of timeval's fields don't agree across platforms */
+  //   #pragma warning(disable: 4244)
+  // #endif
+  // tv.tv_sec = dyad_updateTimeout;
+  // tv.tv_usec = (dyad_updateTimeout - tv.tv_sec) * 1e6;
+  // #ifdef _MSC_VER
+  //   #pragma warning(pop)
+  // #endif
 
-  select(dyad_selectSet.maxfd + 1,
-         dyad_selectSet.fds[SELECT_READ],
-         dyad_selectSet.fds[SELECT_WRITE],
-         dyad_selectSet.fds[SELECT_EXCEPT],
-         &tv);
+  // select(dyad_selectSet.maxfd + 1,
+  //        dyad_selectSet.fds[SELECT_READ],
+  //        dyad_selectSet.fds[SELECT_WRITE],
+  //        dyad_selectSet.fds[SELECT_EXCEPT],
+  //        &tv);
 
   /* Handle streams */
   stream = dyad_streams;

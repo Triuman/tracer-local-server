@@ -88,7 +88,7 @@
 ; a H.264 mountpoint: you can feed it an x264enc+rtph264pay pipeline in
 ; gstreamer.
 ;
-[CarId1]
+[CarId1left]
 type = rtp
 id = 1
 description = H.264 live stream coming from gstreamer
@@ -100,8 +100,23 @@ videoport = 8004
 videopt = 96
 videortpmap = H264/90000
 videofmtp =  profile-level-id=42c01f\;packetization-mode=1\;level-asymmetry-allowed=1
-camera_url = rtsp://192.168.1.26/live
+camera_url = rtsp://192.168.1.81/live
+gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.81/live ! rtph264depay ! rtph264pay config-interval=10 pt=96 ! udpsink host=127.0.0.1 port=8004
 
+[CarId1right]
+type = rtp
+id = 2
+description = H.264 live stream coming from gstreamer
+audio = no
+video = yes
+audioport = 8002
+audiopt = 97
+videoport = 8008
+videopt = 96
+videortpmap = H264/90000
+videofmtp =  profile-level-id=42c01f\;packetization-mode=1\;level-asymmetry-allowed=1
+camera_url = rtsp://192.168.1.82/live
+gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.82/live ! rtph264depay ! rtph264pay config-interval=10 pt=96 ! udpsink host=127.0.0.1 port=8008
 
 
 ;[carid1rtsp]

@@ -383,12 +383,15 @@ static janus_callbacks *gateway = NULL;
 static GThread *handler_thread;
 static GThread *watchdog;
 static GThread *gstreamer_thread;
+static GThread *gstreamer_loop_thread;
+
 static void *janus_streaming_handler(void *data);
 static void *janus_streaming_ondemand_thread(void *data);
 static void *janus_streaming_filesource_thread(void *data);
 static void janus_streaming_relay_rtp_packet(gpointer data, gpointer user_data);
 static void *janus_streaming_relay_thread(void *data);
 static void janus_streaming_hangup_media_internal(janus_plugin_session *handle);
+
 
 static int gstreamerStreamingStatus = 0;
 typedef enum gstreamer_streaming_status {
@@ -400,7 +403,10 @@ typedef enum gstreamer_streaming_status {
 	gstreamer_streaming_status_stopped,
 } gstreamer_streaming_status;
 
+GMainLoop *gstreamer_loop;
+
 static void *gstreamer_streaming_thread(void *data);
+static void *gstreamer_loop_thread_function(void *data);
 
 typedef enum janus_streaming_type {
 	janus_streaming_type_none = 0,
@@ -443,6 +449,9 @@ typedef struct janus_streaming_rtp_source {
 	janus_mutex rec_mutex;	/* Mutex to protect the recorders from race conditions */
 	janus_rtp_switching_context context[3];
 	char *camera_url;
+	GstElement *gstreamer_pipeline;
+	char *gstreamer_pipeline_string;
+	int gstreamer_status;
 	int audio_fd;
 	int video_fd[3];
 	int data_fd;
@@ -532,7 +541,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 		uint64_t id, char *name, char *desc,
 		int srtpsuite, char *srtpcrypto,
 		gboolean doaudio, char *amcast, const janus_network_address *aiface, uint16_t aport, uint8_t acodec, char *artpmap, char *afmtp, gboolean doaskew,
-		gboolean dovideo, char *vmcast, const janus_network_address *viface, uint16_t vport, uint8_t vcodec, char *vrtpmap, char *vfmtp, char *camera_url, gboolean bufferkf,
+		gboolean dovideo, char *vmcast, const janus_network_address *viface, uint16_t vport, uint8_t vcodec, char *vrtpmap, char *vfmtp, char *camera_url, char *gstreamer_pipeline_string, gboolean bufferkf,
 			gboolean simulcast, uint16_t vport2, uint16_t vport3, gboolean dovskew, int rtp_collision,
 		gboolean dodata, const janus_network_address *diface, uint16_t dport, gboolean buffermsg);
 /* Helper to create a file/ondemand live source */
@@ -582,8 +591,6 @@ typedef struct janus_streaming_session {
 	janus_streaming_mountpoint *mountpoint;
 	gint64 sdp_sessid;
 	gint64 sdp_version;
-	GstElement *gstreamer_pipeline;
-	int gstreamer_status;
 	gboolean started;
 	gboolean paused;
 	gboolean audio, video, data;		/* Whether audio, video and/or data must be sent to this listener */
@@ -764,6 +771,9 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 		return -1;
 	}
 
+	gst_init(NULL, NULL);
+	JANUS_LOG(LOG_INFO, "GStreamer Initialized\n");
+
 	struct ifaddrs *ifas = NULL;
 	if(getifaddrs(&ifas) || ifas == NULL) {
 		JANUS_LOG(LOG_ERR, "Unable to acquire list of network devices/interfaces; some configurations may not work as expected...\n");
@@ -823,6 +833,7 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 				janus_config_item *video = janus_config_get_item(cat, "video");
 				janus_config_item *vskew = janus_config_get_item(cat, "videoskew");
 				janus_config_item *camera_url = janus_config_get_item(cat, "camera_url");
+				janus_config_item *gstreamer_pipeline_string = janus_config_get_item(cat, "gstreamer_pipeline_string");
 				janus_config_item *data = janus_config_get_item(cat, "data");
 				janus_config_item *diface = janus_config_get_item(cat, "dataiface");
 				janus_config_item *amcast = janus_config_get_item(cat, "audiomcast");
@@ -974,6 +985,7 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 						vrtpmap ? (char *)vrtpmap->value : NULL,
 						vfmtp ? (char *)vfmtp->value : NULL,
 						camera_url ? (char *)camera_url->value : NULL,
+						gstreamer_pipeline_string ? (char *)gstreamer_pipeline_string->value : NULL,
 						bufferkf,
 						simulcast,
 						(vport2 && vport2->value) ? atoi(vport2->value) : 0,
@@ -1241,7 +1253,16 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 	/* This is the callback we'll need to invoke to contact the gateway */
 	gateway = callback;
 
+	gstreamer_loop = g_main_loop_new(NULL, FALSE);
 	GError *error = NULL;
+	/* Start the gstreamer_loop_thread */
+	gstreamer_loop_thread = g_thread_try_new("Gstreamer streaming thread", &gstreamer_loop_thread_function, NULL, &error);
+	if (!gstreamer_loop_thread) {
+		g_atomic_int_set(&initialized, 0);
+		JANUS_LOG(LOG_ERR, "Got error %d (%s) trying to launch the Gstreamer loop thread...\n", error->code, error->message ? error->message : "??");
+		janus_config_destroy(config);
+		return -1;
+	}
 	/* Start the gstreamer_thread */
 	gstreamer_thread = g_thread_try_new("Gstreamer streaming thread", &gstreamer_streaming_thread, NULL, &error);
 	if (!gstreamer_thread) {
@@ -1270,151 +1291,295 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 	return 0;
 }
 
-
-void* gstreamer_init_pipeline_rtspsrc(janus_streaming_session *session, char* location, int pt, int port)
+static void cb_new_rtspsrc_pad(GstElement *element,GstPad*pad,gpointer  data)
 {
-	//gst - launch - 1.0 
-	//rtpcsrc location=rtsp:192...
-	//rtph264depay
-	//rtph264pay config-interval=10 pt=96
-	//udpsink host=127.0.0.1 port=8004
+	JANUS_LOG(LOG_ERR, "cb_new_rtspsrc_pad was CALLED!!!\n");
 
-	//Video elements
-	GstElement *rtspsrc;
-	GstElement *rtph264depay;
-	GstElement *rtph264pay;
-	GstElement *udpsink;
+	gchar *name;
+	GstCaps * p_caps;
+	gchar * description;
+	GstElement *p_rtph264depay;
 
-	/* Create the empty pipeline */
-	session->gstreamer_pipeline = gst_pipeline_new("pipeline");
+	name = gst_pad_get_name(pad);
+	JANUS_LOG(LOG_ERR, "A new pad %s was created\n", name);
 
-	/* Create elements */
-	//Video elements
-	rtspsrc = gst_element_factory_make("rtspsrc", "rtspsrc");
-	rtph264depay = gst_element_factory_make("rtph264depay", "rtph264depay");
-	rtph264pay = gst_element_factory_make("rtph264pay", "rtph264pay");
-	udpsink = gst_element_factory_make("udpsink", "udpsink");
+	// here, you would setup a new pad link for the newly created pad
+	// sooo, now find that rtph264depay is needed and link them?
+	p_caps = gst_pad_get_pad_template_caps (pad);
+
+	description = gst_caps_to_string(p_caps);
+	printf("%s\n",p_caps,", ",description,"\n");
+	g_free(description);
+
+	p_rtph264depay = GST_ELEMENT(data);
+
+	// try to link the pads then ...
+	if(!gst_element_link_pads(element, name, p_rtph264depay, "sink"))
+	{
+		JANUS_LOG(LOG_ERR, "Elements could not be linked. rtspsrc and rtph264depay\n");
+	}else
+		JANUS_LOG(LOG_ERR, "Elements linked! rtspsrc and rtph264depay\n");
+
+	g_free(name);
+}
+
+static gboolean on_pipeline_bus_message (GstBus * bus, GstMessage * message, janus_streaming_session *session)
+{
+	JANUS_LOG(LOG_ERR, "GOT GST BUS MESSAGE\n");
+
+  switch (GST_MESSAGE_TYPE (message)) {
+    case GST_MESSAGE_EOS:
+		JANUS_LOG(LOG_ERR, "The source got dry\n");
+    case GST_MESSAGE_ERROR:
+		JANUS_LOG(LOG_ERR, "Received error\n");
+
+		// gst_element_set_state(session->gstreamer_pipeline, GST_STATE_NULL);
+		// gst_object_unref(session->gstreamer_pipeline);
+		// session->gstreamer_pipeline = NULL;
+		// GstElement *gstreamer_pipeline = gst_parse_launch(session->gstreamer_pipeline_string, NULL);
+		// gst_element_set_state(gstreamer_pipeline, GST_STATE_READY);
+
+	//   if(session){
+	// 	//Restart the pipeline
+	// 	session->gstreamer_status = gstreamer_streaming_status_start;
+	//   }
 
 
-	if (!session->gstreamer_pipeline || !rtspsrc || !rtph264depay || !rtph264pay || !udpsink) {
-		JANUS_LOG(LOG_ERR, "GStreamer; Unable to create GStreamer elements!\n");
-		return;
-	}
+      break;
+    default:
+      break;
+  }
+  return TRUE;
+}
+void* gstreamer_init_pipeline_rtspsrc_from_string(janus_streaming_rtp_source *source)
+{
+	source->gstreamer_pipeline = gst_parse_launch(source->gstreamer_pipeline_string, NULL);
 
-	/* Build the pipeline. */
-	gst_bin_add(GST_BIN(session->gstreamer_pipeline), rtspsrc);
-	gst_bin_add(GST_BIN(session->gstreamer_pipeline), rtph264depay);
-	gst_bin_add(GST_BIN(session->gstreamer_pipeline), rtph264pay);
-	gst_bin_add(GST_BIN(session->gstreamer_pipeline), udpsink);
+	/* to be notified of messages from this pipeline, mostly EOS */
+	// GstBus *bus = gst_element_get_bus (session->gstreamer_pipeline);
+	// gst_bus_add_signal_watch (bus);
+	// g_signal_connect (G_OBJECT (bus), "message::error", (GCallback)on_pipeline_bus_message, &session);
+	// gst_object_unref (bus);
 
-
-	if (!gst_element_link(rtspsrc, rtph264depay)) {
-		g_printerr("Elements could not be linked. rtspsrc, rtph264depay\n");
-		gst_object_unref(session->gstreamer_pipeline);
-		return -1;
-	}
-	if (!gst_element_link(rtph264depay, rtph264pay)) {
-		g_printerr("Elements could not be linked. rtph264depay, rtph264pay\n");
-		gst_object_unref(session->gstreamer_pipeline);
-		return -1;
-	}
-	if (!gst_element_link(rtph264pay, udpsink)) {
-		g_printerr("Elements could not be linked. rtph264pay, udpsink\n");
-		gst_object_unref(session->gstreamer_pipeline);
-		return -1;
-	}
-
-	//gst - launch - 1.0 
-	//rtpcsrc location=rtsp:192...
-	//rtph264depay
-	//rtph264pay config-interval=10 pt=96
-	//udpsink host=127.0.0.1 port=8004
-
-	/* Set element properties */
-
-	//Video elements
-	g_object_set(rtspsrc, "location", location, NULL);
-	g_object_set(rtph264pay, "config-interval", 1, NULL);
-	g_object_set(rtph264pay, "pt", pt, NULL);
-	g_object_set(udpsink, "host", "127.0.0.1", NULL);
-	g_object_set(udpsink, "port", port, NULL);
-
-	gst_element_set_state(session->gstreamer_pipeline, GST_STATE_READY);
-	session->gstreamer_status = gstreamer_streaming_status_inited;
+	gst_element_set_state(source->gstreamer_pipeline, GST_STATE_READY);
+	source->gstreamer_status = gstreamer_streaming_status_inited;
 	JANUS_LOG(LOG_INFO, "GStreamer Pipeline inited\n");
 }
 
+void* gstreamer_init_pipeline_rtspsrc(janus_streaming_session *session, char* location, int pt, int port)
+{
+	// //gst - launch - 1.0 
+	// //rtpcsrc location=rtsp:192...
+	// //rtph264depay
+	// //rtph264pay config-interval=10 pt=96
+	// //udpsink host=127.0.0.1 port=8004
+
+	// //Video elements
+	// GstElement *rtspsrc;
+	// GstElement *rtph264depay;
+	// GstElement *rtph264pay;
+	// GstElement *udpsink;
+
+	// /* Create the empty pipeline */
+	// session->gstreamer_pipeline = gst_pipeline_new("pipeline");
+
+	// /* Create elements */
+	// //Video elements
+	// rtspsrc = gst_element_factory_make("rtspsrc", "rtspsrcname");
+	// rtph264depay = gst_element_factory_make("rtph264depay", "rtph264depayname");
+	// rtph264pay = gst_element_factory_make("rtph264pay", "rtph264payname");
+	// udpsink = gst_element_factory_make("udpsink", "udpsinkname");
+
+
+	// if (!session->gstreamer_pipeline || !rtspsrc || !rtph264depay || !rtph264pay || !udpsink) {
+	// 	JANUS_LOG(LOG_ERR, "GStreamer; Unable to create GStreamer elements!\n");
+	// 	return;
+	// }
+
+
+	// //Video elements
+	// g_object_set(rtspsrc, "location", location, NULL);
+	// g_object_set(rtspsrc, "latency", 0, NULL);
+	// g_object_set(rtph264pay, "config-interval", 1, NULL);
+	// g_object_set(rtph264pay, "pt", pt, NULL);
+	// g_object_set(udpsink, "host", "127.0.0.1", NULL);
+	// g_object_set(udpsink, "port", port, NULL);
+
+	// // listen for newly created pads
+	// g_signal_connect(rtspsrc, "pad-added", G_CALLBACK(cb_new_rtspsrc_pad),NULL);
+	// gst_element_set_state(rtspsrc, GST_STATE_PLAYING);
+	// JANUS_LOG(LOG_ERR, "Adding GStreamer elements to pipeline!\n");
+	// /* Build the pipeline. */
+	// gst_bin_add(GST_BIN(session->gstreamer_pipeline), rtspsrc);
+	// gst_bin_add_many(GST_BIN(session->gstreamer_pipeline), rtph264depay, rtph264pay, udpsink, NULL);
+	// // gst_bin_add(GST_BIN(session->gstreamer_pipeline), rtph264depay);
+	// // gst_bin_add(GST_BIN(session->gstreamer_pipeline), rtph264pay);
+	// // gst_bin_add(GST_BIN(session->gstreamer_pipeline), udpsink);
+
+
+	// if (!gst_element_link_many(rtph264depay, rtph264pay, udpsink, NULL)) {
+	// 	JANUS_LOG(LOG_ERR, "Elements could not be linked. \n");
+	// 	// gst_object_unref(session->gstreamer_pipeline);
+	// 	// return -1;
+	// }
+	// // if (!gst_element_link(rtph264depay, rtph264pay)) {
+	// // 	g_printerr("Elements could not be linked. rtph264depay, rtph264pay\n");
+	// // 	gst_object_unref(session->gstreamer_pipeline);
+	// // 	return -1;
+	// // }
+	// // if (!gst_element_link(rtph264pay, udpsink)) {
+	// // 	g_printerr("Elements could not be linked. rtph264pay, udpsink\n");
+	// // 	gst_object_unref(session->gstreamer_pipeline);
+	// // 	return -1;
+	// // }
+
+	// //gst - launch - 1.0 
+	// //rtpcsrc location=rtsp:192...
+	// //rtph264depay
+	// //rtph264pay config-interval=10 pt=96
+	// //udpsink host=127.0.0.1 port=8004
+
+	// /* Set element properties */
+
+
+	// gst_element_set_state(session->gstreamer_pipeline, GST_STATE_READY);
+	// session->gstreamer_status = gstreamer_streaming_status_inited;
+	// JANUS_LOG(LOG_INFO, "GStreamer Pipeline inited\n");
+}
+
+void *gstreamer_loop_thread_function(void *data) {
+	JANUS_LOG(LOG_INFO, "GStreamer Loop thread started\n");
+	g_main_loop_run(gstreamer_loop);
+	JANUS_LOG(LOG_INFO, "GStreamer Loop thread ended\n");
+}
 
 void *gstreamer_streaming_thread(void *data) {
 	JANUS_LOG(LOG_INFO, "GStreamer Streaming thread started\n");
-
 	GstStateChangeReturn ret;
 
-	gst_init(NULL, NULL);
-
-	JANUS_LOG(LOG_INFO, "GStreamer Initialized\n");
-
 	while (g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
-		janus_mutex_lock(&sessions_mutex);
+		janus_mutex_lock(&mountpoints_mutex);
 		GHashTableIter iter;
 		gpointer value;
-		g_hash_table_iter_init(&iter, sessions);
+		g_hash_table_iter_init(&iter, mountpoints);
 		while(g_hash_table_iter_next(&iter, NULL, &value)) {
-			janus_streaming_session *session = value;
-			if(session->gstreamer_pipeline == NULL)
-				continue;
-			
-			if (session->gstreamer_status == gstreamer_streaming_status_start)
-			{
-				session->gstreamer_status = gstreamer_streaming_status_started;
-				/* Start playing */
-				ret = gst_element_set_state(session->gstreamer_pipeline, GST_STATE_PLAYING);
+			janus_streaming_mountpoint *mp = value;
+			janus_streaming_rtp_source *source = mp->source;
+			if(g_list_length(mp->listeners) > 0){
+				if(source->gstreamer_status != gstreamer_streaming_status_started){
+					//Set pipeline to Play state.
+					ret = gst_element_set_state(source->gstreamer_pipeline, GST_STATE_PLAYING);
+					if (ret == GST_STATE_CHANGE_FAILURE) {
+						JANUS_LOG(LOG_ERR, "GStreamer; Unable to set the pipeline to the playing state.\n");
+						gst_object_unref(source->gstreamer_pipeline);
+						break;
+					}
+					source->gstreamer_status = gstreamer_streaming_status_started;
+					JANUS_LOG(LOG_WARN, "GStreamer Streaming STARTED. Because we have streamers.\n");
+				}
+			}else if(source->gstreamer_status == gstreamer_streaming_status_started){
+				ret = gst_element_set_state(source->gstreamer_pipeline, GST_STATE_PAUSED);
 				if (ret == GST_STATE_CHANGE_FAILURE) {
 					JANUS_LOG(LOG_ERR, "GStreamer; Unable to set the pipeline to the playing state.\n");
-					gst_object_unref(session->gstreamer_pipeline);
+					gst_object_unref(source->gstreamer_pipeline);
 					break;
 				}
-				JANUS_LOG(LOG_INFO, "GStreamer Streaming started\n");
-			}
-			else if (session->gstreamer_status == gstreamer_streaming_status_stop)
-			{
-				session->gstreamer_status = gstreamer_streaming_status_stopped;
-				gst_element_set_state(session->gstreamer_pipeline, GST_STATE_PAUSED);
-				JANUS_LOG(LOG_INFO, "GStreamer Streaming stopped\n");
+				source->gstreamer_status = gstreamer_streaming_status_stopped;
+				JANUS_LOG(LOG_WARN, "GStreamer Streaming PAUSED. Because no one is streaming.\n");
 			}
 		}
-		janus_mutex_unlock(&sessions_mutex);
-
+		janus_mutex_unlock(&mountpoints_mutex);
 		g_usleep(1 * G_USEC_PER_SEC);
 	}
 
-	janus_mutex_lock(&sessions_mutex);
+	janus_mutex_lock(&mountpoints_mutex);
 	GHashTableIter iter;
 	gpointer value;
-	g_hash_table_iter_init(&iter, sessions);
+	g_hash_table_iter_init(&iter, mountpoints);
 	while(g_hash_table_iter_next(&iter, NULL, &value)) {
-		janus_streaming_session *session = value;
+		janus_streaming_mountpoint *mp = value;
+		janus_streaming_rtp_source *source = mp->source;
+		ret = gst_element_set_state(source->gstreamer_pipeline, GST_STATE_NULL);
+		gst_object_unref(source->gstreamer_pipeline);
+		JANUS_LOG(LOG_WARN, "Setting Gstreamer Pipeline to NULL.\n");
+	}
+	janus_mutex_unlock(&mountpoints_mutex);
 
-		session->gstreamer_status = gstreamer_streaming_status_stopped;
-		gst_element_set_state(session->gstreamer_pipeline, GST_STATE_NULL);
-		gst_object_unref(session->gstreamer_pipeline);
 
-	}	
-	janus_mutex_unlock(&sessions_mutex);
+	// while (g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
+	// 	janus_mutex_lock(&sessions_mutex);
+	// 	GHashTableIter iter;
+	// 	gpointer value;
+	// 	g_hash_table_iter_init(&iter, sessions);
+	// 	while(g_hash_table_iter_next(&iter, NULL, &value)) {
+	// 		janus_streaming_session *session = value;
+	// 		if(session->gstreamer_pipeline == NULL)
+	// 			continue;
+		
+	// 		if (session->gstreamer_status == gstreamer_streaming_status_start)
+	// 		{
+	// 			session->gstreamer_status = gstreamer_streaming_status_started;
+	// 			/* Start playing */
+	// 			ret = gst_element_set_state(session->gstreamer_pipeline, GST_STATE_PLAYING);
+	// 			if (ret == GST_STATE_CHANGE_FAILURE) {
+	// 				JANUS_LOG(LOG_ERR, "GStreamer; Unable to set the pipeline to the playing state.\n");
+	// 				gst_object_unref(session->gstreamer_pipeline);
+	// 				break;
+	// 			}
+	// 			JANUS_LOG(LOG_INFO, "GStreamer Streaming started\n");
+	// 		}
+	// 		else if (session->gstreamer_status == gstreamer_streaming_status_stop)
+	// 		{
+	// 			session->gstreamer_status = gstreamer_streaming_status_stopped;
+	// 			gst_element_set_state(session->gstreamer_pipeline, GST_STATE_PAUSED);
+	// 			JANUS_LOG(LOG_INFO, "GStreamer Streaming stopped\n");
+	// 		}
+	// 	}
+
+
+	// 	if(old_sessions != NULL) {
+	// 		GList *sl = old_sessions;
+	// 		JANUS_LOG(LOG_HUGE, "Checking %d old Streaming sessions for GSTREAMER\n", g_list_length(old_sessions));
+	// 		while(sl) {
+	// 			janus_streaming_session *old_session = (janus_streaming_session *)sl->data;
+	// 			if(!old_session) {
+	// 				sl = sl->next;
+	// 				continue;
+	// 			}
+	// 			if(old_session->gstreamer_pipeline){
+	// 				old_session->gstreamer_status = gstreamer_streaming_status_stopped;
+	// 				gst_element_set_state(old_session->gstreamer_pipeline, GST_STATE_NULL);
+	// 				gst_object_unref(old_session->gstreamer_pipeline);
+	// 				old_session->gstreamer_pipeline = NULL;
+
+	// 				JANUS_LOG(LOG_INFO, "GStreamer set to NULL of an old session!\n");
+	// 			}
+	// 			sl = sl->next;
+	// 		}
+	// 	}
+
+	// 	janus_mutex_unlock(&sessions_mutex);
+		
+	// 	g_usleep(1 * G_USEC_PER_SEC);
+	// }
+
+	// janus_mutex_lock(&sessions_mutex);
+	// GHashTableIter iter;
+	// gpointer value;
+	// g_hash_table_iter_init(&iter, sessions);
+	// while(g_hash_table_iter_next(&iter, NULL, &value)) {
+	// 	janus_streaming_session *session = value;
+
+	// 	session->gstreamer_status = gstreamer_streaming_status_stopped;
+	// 	gst_element_set_state(session->gstreamer_pipeline, GST_STATE_NULL);
+	// 	gst_object_unref(session->gstreamer_pipeline);
+
+	// }	
+	// janus_mutex_unlock(&sessions_mutex);
+
+	g_main_loop_quit(gstreamer_loop);
 
 	JANUS_LOG(LOG_INFO, "GStreamer destroyed\n");
-}
-
-void start_gstreamer_streaming()
-{
-	if (gstreamerStreamingStatus != gstreamer_streaming_status_started)
-		gstreamerStreamingStatus = gstreamer_streaming_status_start;
-}
-
-void stop_gstreamer_streaming()
-{
-	if (gstreamerStreamingStatus != gstreamer_streaming_status_stopped)
-		gstreamerStreamingStatus = gstreamer_streaming_status_stop;
 }
 
 void janus_streaming_destroy(void) {
@@ -1431,6 +1596,10 @@ void janus_streaming_destroy(void) {
 	if (gstreamer_thread != NULL) {
 		g_thread_join(gstreamer_thread);
 		gstreamer_thread = NULL;
+	}
+	if (gstreamer_loop_thread != NULL) {
+		g_thread_join(gstreamer_loop_thread);
+		gstreamer_loop_thread = NULL;
 	}
 
 	/* Remove all mountpoints */
@@ -1870,6 +2039,7 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 			json_t *video = json_object_get(root, "video");
 			json_t *data = json_object_get(root, "data");
 			json_t *camera_url = json_object_get(root, "camera_url");
+			json_t *gstreamer_pipeline_string = json_object_get(root, "gstreamer_pipeline_string");
 			json_t *rtpcollision = json_object_get(root, "collision");
 			json_t *ssuite = json_object_get(root, "srtpsuite");
 			json_t *scrypto = json_object_get(root, "srtpcrypto");
@@ -2025,7 +2195,7 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 					ssuite ? json_integer_value(ssuite) : 0,
 					scrypto ? (char *)json_string_value(scrypto) : NULL,
 					doaudio, amcast, &audio_iface, aport, acodec, artpmap, afmtp, doaskew,
-					dovideo, vmcast, &video_iface, vport, vcodec, vrtpmap, vfmtp, camera_url ? (char *)json_string_value(camera_url) : NULL, bufferkf,
+					dovideo, vmcast, &video_iface, vport, vcodec, vrtpmap, vfmtp, camera_url ? (char *)json_string_value(camera_url) : NULL, gstreamer_pipeline_string ? (char *)json_string_value(gstreamer_pipeline_string) : NULL, bufferkf,
 					simulcast, vport2, vport3, dovskew,
 					rtpcollision ? json_integer_value(rtpcollision) : 0,
 					dodata, &data_iface, dport, buffermsg);
@@ -2829,7 +2999,6 @@ void janus_streaming_setup_media(janus_plugin_session *handle) {
 		janus_mutex_unlock(&sessions_mutex);
 		return;
 	}
-	//session->gstreamer_status = gstreamer_streaming_status_start;
 	g_atomic_int_set(&session->hangingup, 0);
 	/* We only start streaming towards this user when we get this event */
 	janus_rtp_switching_context_reset(&session->context);
@@ -2956,7 +3125,6 @@ static void janus_streaming_hangup_media_internal(janus_plugin_session *handle) 
 	if(g_atomic_int_add(&session->hangingup, 1)) {
 		return;
 	}
-	session->gstreamer_status = gstreamer_streaming_status_stop;
 
 	session->substream = -1;
 	session->substream_target = 0;
@@ -3212,6 +3380,7 @@ static void *janus_streaming_handler(void *data) {
 					goto done;
 				}
 			}
+
 			/* New viewer: we send an offer ourselves */
 			JANUS_LOG(LOG_VERB, "Request to watch mountpoint/stream %"SCNu64"\n", id_value);
 			session->stopping = FALSE;
@@ -3225,7 +3394,7 @@ static void *janus_streaming_handler(void *data) {
 			session->video = offer_video ? json_is_true(offer_video) : TRUE;	/* True by default */
 			if(!mp->video)
 				session->video = FALSE;	/* ... unless the mountpoint isn't sending any video */
-			session->data = FALSE;	/* True by default */
+			session->data = TRUE;	/* True by default */
 			if(!mp->data)
 				session->data = FALSE;	/* ... unless the mountpoint isn't sending any data */
 			if((!mp->audio || !session->audio) &&
@@ -3346,16 +3515,15 @@ done:
 				g_strlcat(sdptemp, buffer, 2048);
 				g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
 				
-// #ifdef HAVE_SCTP
-// 			if(mp->data && session->data) {
-// 				/* Add data line */
-// 				g_snprintf(buffer, 512,
-// 					"m=application 1 DTLS/SCTP 5000\r\n"
-// 					"c=IN IP4 1.1.1.1\r\n"
-// 					"a=sctpmap:5000 webrtc-datachannel 16\r\n");
-// 				g_strlcat(sdptemp, buffer, 2048);
-// 			}
-// #endif
+#ifdef HAVE_SCTP
+				/* Add data line */
+				g_snprintf(buffer, 512,
+					"m=application 1 DTLS/SCTP 5000\r\n"
+					"c=IN IP4 1.1.1.1\r\n"
+					"a=sctpmap:5000 webrtc-datachannel 16\r\n");
+				g_strlcat(sdptemp, buffer, 2048);
+			
+#endif
 			janus_mutex_unlock(&mp->mutex);
 			sdp = g_strdup(sdptemp);
 			JANUS_LOG(LOG_VERB, "Going to %s this SDP:\n%s\n", sdp_type, sdp);
@@ -3365,17 +3533,6 @@ done:
 			//Tracer Custom function "watch" and "start" combined
 			json_t *id = json_object_get(root, "id");
 			guint64 id_value = json_integer_value(id);
-
-			//If we get the same mountpoint number, we will not rebuild the pipeline again.
-			gboolean same_mountpoint = TRUE;
-			if(session->mountpoint != NULL && session->mountpoint->id != id_value) {
-				//There is a already different mountpoint attached. First stop that stream.
-				gst_element_set_state(session->gstreamer_pipeline, GST_STATE_NULL);
-				gst_object_unref(session->gstreamer_pipeline);
-				session->gstreamer_pipeline = NULL;
-				JANUS_LOG(LOG_VERB, "We stopped the previous mountpoint pipeline.\n");
-				same_mountpoint = FALSE;
-			}
 
 			janus_mutex_lock(&mountpoints_mutex);
 			janus_streaming_mountpoint *mp = g_hash_table_lookup(mountpoints, &id_value);
@@ -3401,14 +3558,6 @@ done:
 			session->video = TRUE;	/* True by default */
 			session->data = TRUE;	/* True by default */
 
-
-			if(mp->streaming_source == janus_streaming_source_rtp && same_mountpoint == FALSE) {
-				janus_streaming_rtp_source *source = (janus_streaming_rtp_source *)mp->source;
-				gstreamer_init_pipeline_rtspsrc(session, source->camera_url, mp->codecs.video_pt, source->video_port);
-
-			}
-			session->gstreamer_status = gstreamer_streaming_status_start;
-			JANUS_LOG(LOG_VERB, "Starting the streaming\n");
 			session->paused = FALSE;
 
 			/* Add the user to the list of watchers and we're done */
@@ -3416,8 +3565,6 @@ done:
 			mp->listeners = g_list_append(mp->listeners, session);
 			janus_mutex_unlock(&mp->mutex);
 		} else if(!strcasecmp(request_text, "stopstream")) {
-			//Pause Gstreamer pipeline
-			session->gstreamer_status = gstreamer_streaming_status_stop;
 			//Even though camera keeps streaming, this line will prevent stream to be realyed to the driver.
 			session->paused = TRUE;
 		} else if(!strcasecmp(request_text, "start")) {
@@ -3866,7 +4013,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 		uint64_t id, char *name, char *desc,
 		int srtpsuite, char *srtpcrypto,
 		gboolean doaudio, char *amcast, const janus_network_address *aiface, uint16_t aport, uint8_t acodec, char *artpmap, char *afmtp, gboolean doaskew,
-		gboolean dovideo, char *vmcast, const janus_network_address *viface, uint16_t vport, uint8_t vcodec, char *vrtpmap, char *vfmtp, char *camera_url, gboolean bufferkf,
+		gboolean dovideo, char *vmcast, const janus_network_address *viface, uint16_t vport, uint8_t vcodec, char *vrtpmap, char *vfmtp, char *camera_url, char *gstreamer_pipeline_string, gboolean bufferkf,
 			gboolean simulcast, uint16_t vport2, uint16_t vport3, gboolean dovskew, int rtp_collision,
 		gboolean dodata, const janus_network_address *diface, uint16_t dport, gboolean buffermsg) {
 	janus_mutex_lock(&mountpoints_mutex);
@@ -4092,6 +4239,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 	live_rtp_source->last_received_video = janus_get_monotonic_time();
 	live_rtp_source->last_received_data = janus_get_monotonic_time();
 	live_rtp_source->camera_url = camera_url;
+	live_rtp_source->gstreamer_pipeline_string = gstreamer_pipeline_string;
 	live_rtp_source->keyframe.enabled = bufferkf;
 	live_rtp_source->keyframe.latest_keyframe = NULL;
 	live_rtp_source->keyframe.temp_keyframe = NULL;
@@ -4132,6 +4280,8 @@ janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 		janus_streaming_mountpoint_free(live_rtp);
 		return NULL;
 	}
+	//Create Gstremaer pipeline now so it can be used immediately later.
+	gstreamer_init_pipeline_rtspsrc_from_string(live_rtp_source);
 	return live_rtp;
 }
 

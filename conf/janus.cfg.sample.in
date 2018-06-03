@@ -4,10 +4,10 @@
 ; and, if needed, shared apisecret and/or token authentication mechanism
 ; between application(s) and Janus.
 [general]
-configs_folder = @confdir@			; Configuration files folder
-plugins_folder = @plugindir@		; Plugins folder
-transports_folder = @transportdir@	; Transports folder
-events_folder = @eventdir@			; Event handlers folder
+configs_folder = /opt/janus/etc/janus			; Configuration files folder
+plugins_folder = /opt/janus/lib/janus/plugins		; Plugins folder
+transports_folder = /opt/janus/lib/janus/transports	; Transports folder
+events_folder = /opt/janus/lib/janus/events			; Event handlers folder
 ;log_to_stdout = false				; Whether the Janus output should be written
 									; to stdout or not (default=true)
 ;log_to_file = /path/to/janus.log	; Whether to use a log file or not
@@ -41,7 +41,7 @@ admin_secret = janusoverlord	; String that all Janus requests must contain
 ;								  in any of the available transports.
 ;server_name = MyJanusInstance	; Public name of this Janus instance
 ;								  as it will appear in an info request
-;session_timeout = 60		; How long (in seconds) we should wait before
+session_timeout = 0		; How long (in seconds) we should wait before
 ;							deciding a Janus session has timed out. A
 ;							session times out when no request is received
 ;							for session_timeout seconds (default=60s).
@@ -64,8 +64,8 @@ admin_secret = janusoverlord	; String that all Janus requests must contain
 
 ; Certificate and key to use for DTLS (and passphrase if needed).
 [certificates]
-cert_pem = @certdir@/mycert.pem
-cert_key = @certdir@/mycert.key
+cert_pem = /opt/janus/share/janus/certs/mycert.pem
+cert_key = /opt/janus/share/janus/certs/mycert.key
 ;cert_pwd = secretpassphrase
 
 
@@ -80,7 +80,7 @@ cert_key = @certdir@/mycert.key
 ; 0 disables these events entirely).
 [media]
 ;ipv6 = true
-;max_nack_queue = 500
+max_nack_queue = 100
 ;rfc_4588 = yes
 ;rtp_port_range = 20000-40000
 ;dtls_mtu = 1200
@@ -104,8 +104,8 @@ cert_key = @certdir@/mycert.key
 ; be used for gathering candidates, and enable or disable the
 ; internal libnice debugging, if needed. 
 [nat]
-;stun_server = stun.voip.eutelia.it
-;stun_port = 3478
+stun_server = stun.l.google.com
+stun_port = 19302
 nice_debug = false
 ;full_trickle = true
 ;ice_lite = true
