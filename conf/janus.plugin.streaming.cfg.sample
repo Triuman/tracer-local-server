@@ -91,6 +91,8 @@
 [CarId1left]
 type = rtp
 id = 1
+car_id = car1uuid
+eye = left
 description = H.264 live stream coming from gstreamer
 audio = no
 video = yes
@@ -106,6 +108,8 @@ gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.81/live 
 [CarId1right]
 type = rtp
 id = 2
+car_id = car1uuid
+eye = right
 description = H.264 live stream coming from gstreamer
 audio = no
 video = yes
@@ -117,99 +121,3 @@ videortpmap = H264/90000
 videofmtp =  profile-level-id=42c01f\;packetization-mode=1\;level-asymmetry-allowed=1
 camera_url = rtsp://192.168.1.82/live
 gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.82/live ! rtph264depay ! rtph264pay config-interval=10 pt=96 ! udpsink host=127.0.0.1 port=8008
-
-
-;[carid1rtsp]
-;type = rtsp
-;id = 11 ;this will be the car id so we can look it up easily
-;description = Yi 4K+ RTSP
-;audio = no
-;video = yes
-;url=rtsp://192.168.1.26/live
-;rtsp_failcheck = no
-
-;[gstreamer-sample]
-;type = rtp
-;id = 1
-;description = Opus/VP8 live stream coming from gstreamer
-;audio = yes
-;video = yes
-;audioport = 5002
-;audiopt = 111
-;audiortpmap = opus/48000/2
-;videoport = 5004
-;videopt = 100
-;videortpmap = VP8/90000
-;secret = adminpwd
-
-;[file-live-sample]
-;type = live
-;id = 2
-;description = a-law file source (radio broadcast)
-;filename = /opt/janus/share/janus/streams/radio.alaw		; See install.sh
-;audio = yes
-;video = no
-;secret = adminpwd
-
-;[file-ondemand-sample]
-;type = ondemand
-;id = 3
-;description = mu-law file source (music)
-;filename = /opt/janus/share/janus/streams/music.mulaw	; See install.sh
-;audio = yes
-;video = no
-;secret = adminpwd
-
-;
-; Firefox Nightly supports H.264 through Cisco's OpenH264 plugin. The only
-; supported profile is the baseline one. This is an example of how to create
-; a H.264 mountpoint: you can feed it an x264enc+rtph264pay pipeline in
-; gstreamer.
-;
-;[h264-sample]
-;type = rtp
-;id = 10
-;description = H.264 live stream coming from gstreamer
-;audio = no
-;video = yes
-;videoport = 8004
-;videopt = 126
-;videortpmap = H264/90000
-;videofmtp = profile-level-id=42e01f\;packetization-mode=1
-
-;
-; This is a sample configuration for Opus/VP8 multicast streams
-;
-;[gstreamer-multicast]
-;type = rtp
-;id = 20
-;description = Opus/VP8 live multicast stream coming from gstreamer 
-;audio = yes
-;video = yes
-;audioport = 5002
-;audiomcast = 232.3.4.5
-;audiopt = 111
-;audiortpmap = opus/48000/2
-;videoport = 5004
-;videomcast = 232.3.4.5
-;videopt = 100
-;videortpmap = VP8/90000
-
-;
-; This is a sample configuration for an RTSP stream: you can specify
-; the url to connect to and whether or not authentication is needed
-; using the url/rtsp_user/rtsp_pwd settings (but notice that digest
-; authentication will only work if you installed libcurl >= 7.45.0)
-; NOTE WELL: the plugin does NOT transcode, so the RTSP stream MUST be
-; in a format the browser can digest (e.g., VP8 or H.264 baseline for video)
-; Again, you can override rtpmap and/or fmtp, if needed
-;
-;[rtsp-test]
-;type = rtsp
-;id = 99
-;description = RTSP Test
-;audio = no
-;video = yes
-;url=rtsp://127.0.0.1:8554/unicast
-;rtsp_user=username
-;rtsp_pwd=password

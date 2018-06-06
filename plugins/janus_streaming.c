@@ -1353,6 +1353,9 @@ static gboolean on_pipeline_bus_message (GstBus * bus, GstMessage * message, jan
 }
 void* gstreamer_init_pipeline_rtspsrc_from_string(janus_streaming_rtp_source *source)
 {
+	if(source->gstreamer_pipeline)
+		gst_object_unref(source->gstreamer_pipeline);
+	source->gstreamer_pipeline = NULL;
 	source->gstreamer_pipeline = gst_parse_launch(source->gstreamer_pipeline_string, NULL);
 
 	/* to be notified of messages from this pipeline, mostly EOS */
@@ -1467,6 +1470,7 @@ void *gstreamer_streaming_thread(void *data) {
 			janus_streaming_rtp_source *source = mp->source;
 			if(g_list_length(mp->listeners) > 0){
 				if(source->gstreamer_status != gstreamer_streaming_status_started){
+					gstreamer_init_pipeline_rtspsrc_from_string(source);
 					//Set pipeline to Play state.
 					ret = gst_element_set_state(source->gstreamer_pipeline, GST_STATE_PLAYING);
 					if (ret == GST_STATE_CHANGE_FAILURE) {
@@ -1478,12 +1482,13 @@ void *gstreamer_streaming_thread(void *data) {
 					JANUS_LOG(LOG_WARN, "GStreamer Streaming STARTED. Because we have streamers.\n");
 				}
 			}else if(source->gstreamer_status == gstreamer_streaming_status_started){
-				ret = gst_element_set_state(source->gstreamer_pipeline, GST_STATE_PAUSED);
+				ret = gst_element_set_state(source->gstreamer_pipeline, GST_STATE_NULL);
 				if (ret == GST_STATE_CHANGE_FAILURE) {
 					JANUS_LOG(LOG_ERR, "GStreamer; Unable to set the pipeline to the playing state.\n");
 					gst_object_unref(source->gstreamer_pipeline);
 					break;
 				}
+				gst_init(NULL, NULL);
 				source->gstreamer_status = gstreamer_streaming_status_stopped;
 				JANUS_LOG(LOG_WARN, "GStreamer Streaming PAUSED. Because no one is streaming.\n");
 			}
@@ -4281,7 +4286,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 		return NULL;
 	}
 	//Create Gstremaer pipeline now so it can be used immediately later.
-	gstreamer_init_pipeline_rtspsrc_from_string(live_rtp_source);
+	//gstreamer_init_pipeline_rtspsrc_from_string(live_rtp_source);
 	return live_rtp;
 }
 
