@@ -91,7 +91,7 @@
 [CarId1left]
 type = rtp
 id = 1
-car_id = car1uuid
+car_id = tracercar1
 eye = left
 description = H.264 live stream coming from gstreamer
 audio = no
@@ -108,7 +108,7 @@ gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.81/live 
 [CarId1right]
 type = rtp
 id = 2
-car_id = car1uuid
+car_id = tracercar1
 eye = right
 description = H.264 live stream coming from gstreamer
 audio = no

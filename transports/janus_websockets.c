@@ -397,7 +397,7 @@ tracer_car *tracer_find_car(char *carid)
     while (tmp_car_list != NULL)
     {
         car = (tracer_car *)tmp_car_list->data;
-
+JANUS_LOG(LOG_INFO, "Comparing car ids: '%s'  '%s'\n", car->id, carid);
         if (!strcasecmp(car->id, carid))
         {
             break;
@@ -598,18 +598,19 @@ static void tracer_socket_onData(dyad_Event *e)
         default:
             car_id = g_malloc0(e->size);
             memcpy(car_id, e->data, e->size);
-            JANUS_LOG(LOG_INFO, "Got a car ID: %s\n", car_id);
+            JANUS_LOG(LOG_INFO, "Got a car ID: '%s'\n", car_id);
 
             car = tracer_find_car(car_id);
             if(car == NULL){
-                JANUS_LOG(LOG_INFO, "There is no car in our list with ID: %s\n", car_id);
+                JANUS_LOG(LOG_INFO, "There is no car in our list with ID: %s. ignoring.\n", car_id);
                 return;
             }
             car->is_online = TRUE;
+            car->socket_stream = e->stream;
 
-            dyad_removeListener(e->remote, DYAD_EVENT_DATA, tracer_socket_onData, NULL);
-            dyad_addListener(e->remote, DYAD_EVENT_DATA, tracer_socket_onData, car);
-            dyad_addListener(e->remote, DYAD_EVENT_CLOSE, tracer_socket_onClose, car);
+            dyad_removeListener(e->stream, DYAD_EVENT_DATA, tracer_socket_onData, NULL);
+            dyad_addListener(e->stream, DYAD_EVENT_DATA, tracer_socket_onData, car);
+            // dyad_addListener(e->stream, DYAD_EVENT_CLOSE, tracer_socket_onClose, car);
 
             //Notify Web Server
             json_t *info = json_object();
@@ -1257,12 +1258,13 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
                 tracer_car *car = tracer_find_car((char *)car_id->value);
                 if(car == NULL){
                     car = g_malloc0(sizeof(tracer_car));
-                    car->id = (char *)car_id->value;
+                    car->id = g_malloc0(strlen(car_id->value)+1);
+                    memcpy(car->id, car_id->value, strlen(car_id->value));
                     janus_mutex_init(&car->mutex);
                     janus_mutex_lock(&tracer_car_list_mutex);
                     tracer_car_list = g_list_append(tracer_car_list, car);
                     janus_mutex_unlock(&tracer_car_list_mutex);
-			        JANUS_LOG(LOG_VERB, "Creating Car with ID: '%s'\n", car_id->value);
+			        JANUS_LOG(LOG_VERB, "Creating Car with ID: '%s'\n", car->id);
                 }
                 if(!strcasecmp(eye->value, "left"))
                     car->mountpoint_id_left = g_ascii_strtoull(mountpoint_id->value, 0, 10);
@@ -1271,7 +1273,6 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
             }
 			cl = cl->next;
 		}
-		/* Done: we keep the configuration file open in case we get a "create" or "destroy" with permanent=true */
 	}
 	janus_config_destroy(config);
 	config = NULL;
@@ -1528,6 +1529,8 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
                 if (driver->car && driver->is_controlling)
                 {
                     char *carCommand = (char *)channelMessage_text;
+
+        JANUS_LOG(LOG_INFO, "Sending commad to car -> %s\n", carCommand);
                     tracer_socket_sendMessage(driver->car, carCommand);
                 }
             } else if (channelMessage_text[0] == '2')
@@ -2180,7 +2183,7 @@ static int janus_websockets_common_callback(
             if (car == NULL)
             {
                 //TODO: Handle this. Let web server know that there is no car with this id.
-                JANUS_LOG(LOG_INFO, "There is no car with ID : %d\n", carId);
+                JANUS_LOG(LOG_INFO, "There is no car with ID : %s\n", carId);
 
 			return 0;
 		}
@@ -2556,7 +2559,7 @@ static int janus_websockets_common_callback(
             json_t *newdriverid = json_object_get(root, "id");
             if (!newdriverid)
             {
-                JANUS_LOG(LOG_ERR, "There is no driver ID in the connecttodriver request.\n");
+                JANUS_LOG(LOG_ERR, "There is no driver ID in the watch request.\n");
                 return 0;
             }
             const char *newDriverId = json_string_value(newdriverid);
@@ -2873,7 +2876,7 @@ static int janus_websockets_common_callback(
             //Set car's owner
             car->driver = driver;
             driver->car = car;
-            driver->is_controlling = FALSE;
+            driver->is_controlling = TRUE;
             return 0;
         }
         else if (!strcasecmp(command_text, "addcontrol"))
