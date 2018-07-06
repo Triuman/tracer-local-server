@@ -1531,7 +1531,7 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
                     char *carCommand = (char *)channelMessage_text;
 
         JANUS_LOG(LOG_INFO, "Sending commad to car -> %s\n", carCommand);
-                    tracer_socket_sendMessage(driver->car, carCommand);
+                    tracer_socket_sendMessage(driver->car, channelMessage_text);
                 }
             } else if (channelMessage_text[0] == '2')
             {
@@ -1540,7 +1540,7 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
                 {
                     char *carCommand = (char *)channelMessage_text;
                     // carCommand[3] = '\0';
-                    tracer_socket_sendMessage(driver->car, carCommand);
+                    tracer_socket_sendMessage(driver->car, channelMessage_text);
                 }
             }
         }
