@@ -2106,8 +2106,16 @@ static int janus_websockets_common_callback(
 			ws_client->destroy = 0;
 			janus_mutex_init(&ws_client->mutex);
 
-        //TODO: Her baglanti geldiginde atama yapmak yerine, mesaj geldiginde dogru sifreyle gelirse atama yap.
-        tracer_webserver_ws_client = ws_client;
+            //TODO: Her baglanti geldiginde atama yapmak yerine, mesaj geldiginde dogru sifreyle gelirse atama yap.
+            tracer_webserver_ws_client = ws_client;
+
+
+            if (the_tracer_track == NULL)
+            {
+                json_t *info = json_object();
+                json_object_set_new(info, "info", json_string("firstconnection"));
+                tracer_send_message_to_web_server(info);
+            }
 
 			/* Let us know when the WebSocket channel becomes writeable */
 			lws_callback_on_writable(wsi);
@@ -2214,7 +2222,7 @@ static int janus_websockets_common_callback(
         }
         else if (!strcasecmp(command_text, "settracklines"))
         {
-            //This message includes id, track line coordinates.
+            //This message includes track line coordinates.
             if (the_tracer_track == NULL)
             {
                 the_tracer_track = g_malloc0(sizeof(tracer_track));
@@ -2322,13 +2330,13 @@ static int janus_websockets_common_callback(
                     //We create a new driver. And create a handle for him by attach request.
                     driver = g_malloc0(sizeof(tracer_driver));
                     janus_mutex_init(&driver->mutex);
-                    driver->id = (char *)driver_id;
+                    driver->id = (char *)driver_id_string;
                     driver->is_online = FALSE;
                     driver->is_controlling = FALSE;
                     janus_mutex_lock(&tracer_driver_list_mutex);
                     tracer_driver_list = g_list_append(tracer_driver_list, driver);
                     janus_mutex_unlock(&tracer_driver_list_mutex);
-                    JANUS_LOG(LOG_INFO, "New driver added to the list : %s\n", driver_id);
+                    JANUS_LOG(LOG_INFO, "New driver added to the list : %s\n", driver_id_string);
                 }
                 if (driver->handle_id_left == NULL)
                 {
