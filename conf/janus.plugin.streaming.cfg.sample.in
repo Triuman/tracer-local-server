@@ -94,7 +94,7 @@ id = 1
 car_id = tracercar1
 eye = left
 description = H.264 live stream coming from gstreamer
-audio = yes
+audio = no
 video = yes
 audioport = 8001
 audiopt = 97
@@ -103,7 +103,8 @@ videopt = 96
 videortpmap = H264/90000
 videofmtp =  profile-level-id=42c01f\;packetization-mode=1\;level-asymmetry-allowed=1
 camera_url = rtsp://192.168.1.81/live
-gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.81/live name=src src. ! rtph264depay ! rtph264pay config-interval=10 pt=96 ! udpsink host=192.168.1.29 port=8002  src. ! decodebin ! rtpopuspay ! udpsink host=192.168.1.29 port=8001
+gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.81/live ! rtph264depay ! rtph264pay config-interval=10 pt=96 ! udpsink host=127.0.0.1 port=8002
+;gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.81/live name=src src. ! rtph264depay ! rtph264pay config-interval=10 pt=96 ! udpsink host=127.0.0.1 port=8002  src. ! decodebin ! rtpopuspay ! udpsink host=127.0.0.1 port=8001
 
 [CarId1right]
 type = rtp
@@ -111,7 +112,7 @@ id = 2
 car_id = tracercar1
 eye = right
 description = H.264 live stream coming from gstreamer
-audio = yes
+audio = no
 video = yes
 audioport = 8003
 audiopt = 97
@@ -120,4 +121,5 @@ videopt = 96
 videortpmap = H264/90000
 videofmtp =  profile-level-id=42c01f\;packetization-mode=1\;level-asymmetry-allowed=1
 camera_url = rtsp://192.168.1.82/live
-gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.81/live name=src src. ! rtph264depay ! rtph264pay config-interval=10 pt=96 ! udpsink host=192.168.1.29 port=8004  src. ! decodebin ! rtpopuspay ! udpsink host=192.168.1.29 port=8003
+gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.82/live ! rtph264depay ! rtph264pay config-interval=10 pt=96 ! udpsink host=127.0.0.1 port=8004
+;gstreamer_pipeline_string = rtspsrc latency=0 location=rtsp://192.168.1.82/live name=src src. ! rtph264depay ! rtph264pay config-interval=10 pt=96 ! udpsink host=127.0.0.1 port=8004  src. ! decodebin ! rtpopuspay ! udpsink host=127.0.0.1 port=8003

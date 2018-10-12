@@ -3470,7 +3470,7 @@ done:
 				"s=Mountpoint %"SCNu64"\r\n", mp->id);
 			g_strlcat(sdptemp, buffer, 2048);
 			g_strlcat(sdptemp, "t=0 0\r\n", 2048);
-			if(mp->codecs.audio_pt >= 0 && session->audio) {
+			//if(mp->codecs.audio_pt >= 0 && session->audio) {
 				/* Add audio line */
 				g_snprintf(buffer, 512,
 					"m=audio 1 RTP/SAVPF %d\r\n"
@@ -3490,7 +3490,7 @@ done:
 					g_strlcat(sdptemp, buffer, 2048);
 				}
 				g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
-			}
+			//}
 			
 				/* Add video line */
 				g_snprintf(buffer, 512,

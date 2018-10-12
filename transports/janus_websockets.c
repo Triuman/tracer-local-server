@@ -467,8 +467,8 @@ void tracer_remove_driver(char *driverid)
             //If this driver owns a car, we remove him from car's driver.
             if (driver->car != NULL)
             {
-                tracer_car *car = tracer_find_car(driver->car);
-                car->driver = NULL;
+                //tracer_car *car = tracer_find_car(driver->car);
+                driver->car->driver = NULL;
             }
             tracer_driver_list = g_list_remove(tracer_driver_list, tmp_driver_list->data);
             g_free(driver);
