@@ -1546,7 +1546,7 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
         }
         else if (!strcasecmp(streaming_text, "event"))
         {
-            //We are only interested in offer the plugin sends
+            //We are only interested in offer/answer the plugin sends
             json_t *jsep = json_object_get(message, "jsep");
             if (!jsep)
             {
@@ -1556,10 +1556,10 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
             json_t *sdp = json_object_get(jsep, "sdp");
 
             info = json_object();
-            json_object_set_new(info, "info", json_string("offer"));
+            json_object_set_new(info, "info", json_object_get(jsep, "type"));
             json_object_set_new(info, "driverid", json_string(driver->id));
             json_object_set_new(info, "sdp", sdp);
-            //Send also if this is offer for left or right.
+            //Send also if this is offer/answer for left or right.
             if(handle_id == driver->handle_id_left){
                 json_object_set_new(info, "isleft", json_true());
             }else{
@@ -1616,23 +1616,38 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
                 //We got the right and last handle id.
                 driver->handle_id_right = handle_id;
                 JANUS_LOG(LOG_INFO, "Driver '%s' got RIGHT handle id : %" SCNu64 "\n", driver->id, handle_id);
+
+
+                json_decref(message);
+                janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
+
+                info = json_object();
+                json_object_set_new(info, "info", json_string("offerrequest"));
+                json_object_set_new(info, "driverid", json_string(driver->id));
+
+                goto send_info;
             }
 
             json_decref(message);
 
-            //Send connect message to plugin
-            json_t *request = json_object();
-            json_object_set_new(request, "janus", json_string("message"));
-            json_object_set_new(request, "transaction", json_string(driver->id));
-            json_t *body = json_object();
-            json_object_set_new(body, "request", json_string("watch"));
-            json_object_set_new(body, "id", json_integer(mountpoint_id)); //Just to get some info about mountpoint to create SDP.
-            json_object_set_new(request, "body", body);
-            json_object_set_new(request, "session_id", json_integer(tracer_session_id));
-            json_object_set_new(request, "handle_id", json_integer(handle_id));
+            //We are not sending the offer now. We will ask for the offer from the browser here.
+            // //Send connect message to plugin
+            // json_t *request = json_object();
+            // json_object_set_new(request, "janus", json_string("message"));
+            // json_object_set_new(request, "transaction", json_string(driver->id));
+            // json_t *body = json_object();
+            // json_object_set_new(body, "request", json_string("watch"));
+            // json_object_set_new(body, "id", json_integer(mountpoint_id)); //Just to get some info about mountpoint to create SDP.
+            // json_object_set_new(request, "body", body);
+            // json_object_set_new(request, "session_id", json_integer(tracer_session_id));
+            // json_object_set_new(request, "handle_id", json_integer(handle_id));
 
-            gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, 0, request, NULL);
+            // gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, 0, request, NULL);
+
+        
             janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
+
+
             return 0;
         }
         janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
@@ -2989,6 +3004,39 @@ static int janus_websockets_common_callback(
                 json_object_set_new(body, "request", json_string("acceptanswer")); //Normally, answer comes with a "start" request. Check if it works without any request.
                 json_object_set_new(message, "body", body);
                 json_object_set_new(message, "jsep", answersdp);
+            }
+
+            goto send_message;
+        }
+        else if (!strcasecmp(command_text, "offersdp"))
+        {
+            //Send answer to Janus Core
+            json_t *offersdp = json_object_get(root, "offersdp");
+            json_t *isleft = json_object_get(root, "isleft");
+
+            //{"janus":"message","body":{"request":"start"},"transaction":"765EejXJtvRi","jsep":{"type":"answer","sdp":""}}
+            if(isleft == json_true()){
+                message = json_object();
+                json_object_set_new(message, "janus", json_string("message"));
+                json_object_set_new(message, "transaction", json_string(driver->id));
+                json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
+                json_t *body = json_object();
+                json_object_set_new(body, "request", json_string("acceptoffer"));
+                json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
+                json_object_set_new(message, "body", body);
+                json_object_set_new(message, "jsep", offersdp);
+            }else{
+                message = json_object();
+                json_object_set_new(message, "janus", json_string("message"));
+                json_object_set_new(message, "transaction", json_string(driver->id));
+                json_object_set_new(message, "session_id", json_integer(tracer_session_id));
+                json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
+                json_t *body = json_object();
+                json_object_set_new(body, "request", json_string("acceptoffer"));
+                json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
+                json_object_set_new(message, "body", body);
+                json_object_set_new(message, "jsep", offersdp);
             }
 
             goto send_message;
