@@ -100,10 +100,12 @@ function updateServerInfo() {
 			console.log(json);
 			var pluginsJson = json.plugins;
 			var transportsJson = json.transports;
+			var eventsJson = json.events;
 			delete json.janus;
 			delete json.transaction;
 			delete json.plugins;
 			delete json.transports;
+			delete json.events;
 			for(var k in json) {
 				var v = json[k];
 				$('#server-details').append(
@@ -123,10 +125,19 @@ function updateServerInfo() {
 					'	<td>' + v.version_string + '</td>' +
 					'</tr>');
 			}
-			console.log(plugins);
 			for(var t in transportsJson) {
 				var v = transportsJson[t];
 				$('#server-transports').append(
+					'<tr>' +
+					'	<td>' + v.name + '</td>' +
+					'	<td>' + v.author + '</td>' +
+					'	<td>' + v.description + '</td>' +
+					'	<td>' + v.version_string + '</td>' +
+					'</tr>');
+			}
+			for(var e in eventsJson) {
+				var v = eventsJson[e];
+				$('#server-handlers').append(
 					'<tr>' +
 					'	<td>' + v.name + '</td>' +
 					'	<td>' + v.author + '</td>' +
@@ -305,6 +316,20 @@ function updateSettings() {
 								setLockingDebug(!settings["locking_debug"]);
 						});
 					});
+				} else if(k === 'refcount_debug') {
+					$('#'+k).append('<button id="' + k + '_button" type="button" class="btn btn-xs"></button>');
+					$('#'+k + "_button")
+						.addClass(!settings[k] ? "btn-success" : "btn-danger")
+						.html(!settings[k] ? "Enable reference counters debug" : "Disable reference counters debug");
+					$('#'+k + "_button").click(function() {
+						var text = (!settings["refcount_debug"] ?
+							"Are you sure you want to enable the reference counters debug?<br/>This will print a line on the console any time a reference counter is increased/decreased"
+								: "Are you sure you want to disable the reference counters debug?");
+						bootbox.confirm(text, function(result) {
+							if(result)
+								setRefcountDebug(!settings["refcount_debug"]);
+						});
+					});
 				} else if(k === 'log_timestamps') {
 					$('#'+k).append('<button id="' + k + '_button" type="button" class="btn btn-xs"></button>');
 					$('#'+k + "_button")
@@ -377,6 +402,11 @@ function setLogLevel(level) {
 
 function setLockingDebug(enable) {
 	var request = { "janus": "set_locking_debug", "debug": enable, "transaction": randomString(12), "admin_secret": secret };
+	sendSettingsRequest(request);
+}
+
+function setRefcountDebug(enable) {
+	var request = { "janus": "set_refcount_debug", "debug": enable, "transaction": randomString(12), "admin_secret": secret };
 	sendSettingsRequest(request);
 }
 

@@ -6,7 +6,7 @@
  * Janus API, using the libwebsockets library (http://libwebsockets.org).
  * This means that, with the help of this module, browsers or applications
  * (e.g., nodejs server side implementations) can also make use of
- * WebSockets to make requests to the gateway. In that case, the same
+ * WebSockets to make requests to Janus. In that case, the same
  * WebSocket can be used for both sending requests and receiving
  * notifications, without the need for long polls. At the same time,
  * without the concept of a REST path, requests sent through the
@@ -67,9 +67,10 @@ const char *janus_websockets_get_author(void);
 const char *janus_websockets_get_package(void);
 gboolean janus_websockets_is_janus_api_enabled(void);
 gboolean janus_websockets_is_admin_api_enabled(void);
-int janus_websockets_send_message(void *transport, void *request_id, gboolean admin, json_t *message);
-void janus_websockets_session_created(void *transport, guint64 session_id);
-void janus_websockets_session_over(void *transport, guint64 session_id, gboolean timeout);
+int janus_websockets_send_message(janus_transport_session *transport, void *request_id, gboolean admin, json_t *message);
+void janus_websockets_session_created(janus_transport_session *transport, guint64 session_id);
+void janus_websockets_session_over(janus_transport_session *transport, guint64 session_id, gboolean timeout, gboolean claimed);
+void janus_websockets_session_claimed(janus_transport_session *transport, guint64 session_id);
 
 
 /* Transport setup */
@@ -92,6 +93,7 @@ static janus_transport janus_websockets_transport =
 		.send_message = janus_websockets_send_message,
 		.session_created = janus_websockets_session_created,
 		.session_over = janus_websockets_session_over,
+		.session_claimed = janus_websockets_session_claimed,
 	);
 
 /* Transport creator */
@@ -114,6 +116,42 @@ static size_t json_format = JSON_INDENT(3) | JSON_PRESERVE_ORDER;
 
 /* Logging */
 static int ws_log_level = 0;
+static const char *janus_websockets_get_level_str(int level) {
+	switch(level) {
+		case LLL_ERR:
+			return "ERR";
+		case LLL_WARN:
+			return "WARN";
+		case LLL_NOTICE:
+			return "NOTICE";
+		case LLL_INFO:
+			return "INFO";
+		case LLL_DEBUG:
+			return "DEBUG";
+		case LLL_PARSER:
+			return "PARSER";
+		case LLL_HEADER:
+			return "HEADER";
+		case LLL_EXT:
+			return "EXT";
+		case LLL_CLIENT:
+			return "CLIENT";
+		case LLL_LATENCY:
+			return "LATENCY";
+#if (LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 2) || (LWS_LIBRARY_VERSION_MAJOR >= 3)
+		case LLL_USER:
+			return "USER";
+#endif
+		case LLL_COUNT:
+			return "COUNT";
+		default:
+			return NULL;
+	}
+}
+static void janus_websockets_log_emit_function(int level, const char *line) {
+	/* FIXME Do we want to use different Janus debug levels according to the level here? */
+	JANUS_LOG(LOG_INFO, "[libwebsockets][%s] %s", janus_websockets_get_level_str(level), line);
+}
 
 /* WebSockets service thread */
 static GThread *ws_thread = NULL;
@@ -122,6 +160,7 @@ static GThread *race_thread = NULL;
 void *janus_websockets_thread(void *data);
 void *tracer_socket_server_thread(void *data);
 void *tracer_race_thread(void *data);
+
 
 /* WebSocket client session */
 typedef struct janus_websockets_client {
@@ -132,16 +171,13 @@ typedef struct janus_websockets_client {
 	int buflen;								/* Length of the buffer (may be resized after re-allocations) */
 	int bufpending;							/* Data an interrupted previous write couldn't send */
 	int bufoffset;							/* Offset from where the interrupted previous write should resume */
-	janus_mutex mutex;						/* Mutex to lock/unlock this session */
-	gint session_timeout:1;					/* Whether a Janus session timeout occurred in the core */
-	gint destroy:1;							/* Flag to trigger a lazy session destruction */
+	volatile gint destroyed;				/* Whether this libwebsockets client instance has been closed */
+	janus_transport_session *ts;			/* Janus core-transport session */
 } janus_websockets_client;
+
 
 /* libwebsockets WS context */
 static struct lws_context *wsc = NULL;
-/* libwebsockets sessions that have been closed */
-static GList *old_wss;
-static janus_mutex old_wss_mutex = JANUS_MUTEX_INITIALIZER;
 /* Callbacks for HTTP-related events (automatically rejected) */
 static int janus_websockets_callback_http(
 		struct lws *wsi,
@@ -780,28 +816,34 @@ void tracer_send_message_to_web_server(json_t *message)
     char *payload = json_dumps(message, json_format);
     g_async_queue_push(tracer_webserver_ws_client->messages, payload);
     lws_callback_on_writable(tracer_webserver_ws_client->wsi);
-    janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
     json_decref(message);
 }
 
 /* Helper method to return the interface associated with a local IP address */
 static char *janus_websockets_get_interface_name(const char *ip) {
 	struct ifaddrs *addrs = NULL, *iap = NULL;
-	getifaddrs(&addrs);
+	if(getifaddrs(&addrs) == -1)
+		return NULL;
 	for(iap = addrs; iap != NULL; iap = iap->ifa_next) {
 		if(iap->ifa_addr && (iap->ifa_flags & IFF_UP)) {
 			if(iap->ifa_addr->sa_family == AF_INET) {
 				struct sockaddr_in *sa = (struct sockaddr_in *)(iap->ifa_addr);
 				char buffer[16];
 				inet_ntop(iap->ifa_addr->sa_family, (void *)&(sa->sin_addr), buffer, sizeof(buffer));
-				if(!strcmp(ip, buffer))
-					return g_strdup(iap->ifa_name);
+				if(!strcmp(ip, buffer)) {
+					char *iface = g_strdup(iap->ifa_name);
+					freeifaddrs(addrs);
+					return iface;
+				}
 			} else if(iap->ifa_addr->sa_family == AF_INET6) {
 				struct sockaddr_in6 *sa = (struct sockaddr_in6 *)(iap->ifa_addr);
 				char buffer[48];
 				inet_ntop(iap->ifa_addr->sa_family, (void *)&(sa->sin6_addr), buffer, sizeof(buffer));
-				if(!strcmp(ip, buffer))
-					return g_strdup(iap->ifa_name);
+				if(!strcmp(ip, buffer)) {
+					char *iface = g_strdup(iap->ifa_name);
+					freeifaddrs(addrs);
+					return iface;
+				}
 			}
 		}
 	}
@@ -865,7 +907,7 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
 	JANUS_LOG(LOG_WARN, "libwebsockets has been built without IPv6 support, will bind to IPv4 only\n");
 #endif
 
-	/* This is the callback we'll need to invoke to contact the gateway */
+	/* This is the callback we'll need to invoke to contact the Janus core */
 	gateway = callback;
 
 	/* Prepare the common context */
@@ -914,13 +956,51 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
 
 		item = janus_config_get_item_drilldown(config, "general", "ws_logging");
 		if(item && item->value) {
-			ws_log_level = atoi(item->value);
-			if(ws_log_level < 0)
-				ws_log_level = 0;
+			/* libwebsockets uses a mask to set log levels, as documented here:
+			 * https://libwebsockets.org/lws-api-doc-master/html/group__log.html */
+			if(strstr(item->value, "none")) {
+				/* Disable libwebsockets logging completely (the default) */
+			} else if(strstr(item->value, "all")) {
+				/* Enable all libwebsockets logging */
+				ws_log_level = LLL_ERR | LLL_WARN | LLL_NOTICE | LLL_INFO |
+					LLL_DEBUG | LLL_PARSER | LLL_HEADER | LLL_EXT |
+#if (LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 2) || (LWS_LIBRARY_VERSION_MAJOR >= 3)
+					LLL_CLIENT | LLL_LATENCY | LLL_USER | LLL_COUNT;
+#else
+					LLL_CLIENT | LLL_LATENCY | LLL_COUNT;
+#endif
+			} else {
+				/* Only enable some of the properties */
+				if(strstr(item->value, "err"))
+					ws_log_level |= LLL_ERR;
+				if(strstr(item->value, "warn"))
+					ws_log_level |= LLL_WARN;
+				if(strstr(item->value, "notice"))
+					ws_log_level |= LLL_NOTICE;
+				if(strstr(item->value, "info"))
+					ws_log_level |= LLL_INFO;
+				if(strstr(item->value, "debug"))
+					ws_log_level |= LLL_DEBUG;
+				if(strstr(item->value, "parser"))
+					ws_log_level |= LLL_PARSER;
+				if(strstr(item->value, "header"))
+					ws_log_level |= LLL_HEADER;
+				if(strstr(item->value, "ext"))
+					ws_log_level |= LLL_EXT;
+				if(strstr(item->value, "client"))
+					ws_log_level |= LLL_CLIENT;
+				if(strstr(item->value, "latency"))
+					ws_log_level |= LLL_LATENCY;
+#if (LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 2) || (LWS_LIBRARY_VERSION_MAJOR >= 3)
+				if(strstr(item->value, "user"))
+					ws_log_level |= LLL_USER;
+#endif
+				if(strstr(item->value, "count"))
+					ws_log_level |= LLL_COUNT;
+			}
 		}
-		JANUS_LOG(LOG_VERB, "libwebsockets logging: %d\n", ws_log_level);
-		lws_set_log_level(ws_log_level, NULL);
-		old_wss = NULL;
+		JANUS_LOG(LOG_INFO, "libwebsockets logging: %d\n", ws_log_level);
+		lws_set_log_level(ws_log_level, janus_websockets_log_emit_function);
 
 		/* Any ACL for either the Janus or Admin API? */
 		item = janus_config_get_item_drilldown(config, "general", "ws_acl");
@@ -964,7 +1044,7 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
 		int pingpong_trigger = 0, pingpong_timeout = 0;
 		item = janus_config_get_item_drilldown(config, "general", "pingpong_trigger");
 		if(item && item->value) {
-#if LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 1
+#if (LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 1) || (LWS_LIBRARY_VERSION_MAJOR >= 3)
 			pingpong_trigger = atoi(item->value);
 			if(pingpong_trigger < 0) {
 				JANUS_LOG(LOG_WARN, "Invalid value for pingpong_trigger (%d), ignoring...\n", pingpong_trigger);
@@ -976,7 +1056,7 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
 		}
 		item = janus_config_get_item_drilldown(config, "general", "pingpong_timeout");
 		if(item && item->value) {
-#if LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 1
+#if (LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 1) || (LWS_LIBRARY_VERSION_MAJOR >= 3)
 			pingpong_timeout = atoi(item->value);
 			if(pingpong_timeout < 0) {
 				JANUS_LOG(LOG_WARN, "Invalid value for pingpong_timeout (%d), ignoring...\n", pingpong_timeout);
@@ -989,7 +1069,7 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
 		if((pingpong_trigger && !pingpong_timeout) || (!pingpong_trigger && pingpong_timeout)) {
 			JANUS_LOG(LOG_WARN, "pingpong_trigger and pingpong_timeout not both set, ignoring...\n");
 		}
-#if LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 1
+#if (LWS_LIBRARY_VERSION_MAJOR >= 2 && LWS_LIBRARY_VERSION_MINOR >= 1) || (LWS_LIBRARY_VERSION_MAJOR >= 3)
 		if(pingpong_trigger > 0 && pingpong_timeout > 0) {
 			wscinfo.ws_ping_pong_interval = pingpong_trigger;
 			wscinfo.timeout_secs = pingpong_timeout;
@@ -1111,8 +1191,8 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
 				} else {
 					JANUS_LOG(LOG_INFO, "Secure WebSockets server started (port %d)...\n", wsport);
 				}
-				g_free(ip);
 			}
+			g_free(ip);
 		}
 		/* Do the same for the Admin API, if enabled */
 		item = janus_config_get_item_drilldown(config, "admin", "admin_ws");
@@ -1219,8 +1299,8 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
 				} else {
 					JANUS_LOG(LOG_INFO, "Secure Admin WebSockets server started (port %d)...\n", wsport);
 				}
-				g_free(ip);
 			}
+			g_free(ip);
 		}
 	}
 	janus_config_destroy(config);
@@ -1318,8 +1398,6 @@ int janus_websockets_init(janus_transport_callbacks *callback, const char *confi
 
     //Create a session
     tracer_webserver_ws_client = g_malloc0(sizeof(janus_websockets_client));
-    tracer_webserver_ws_client->destroy = 0;
-    janus_mutex_init(&tracer_webserver_ws_client->mutex);
 
     //Send connect message to plugin
     json_t *request = json_object();
@@ -1366,27 +1444,19 @@ static void janus_websockets_destroy_client(
 		janus_websockets_client *ws_client,
 		struct lws *wsi,
 		const char *log_prefix) {
-	if(!ws_client || ws_client->destroy)
+	if(!ws_client || !g_atomic_int_compare_and_exchange(&ws_client->destroyed, 0, 1))
 		return;
+	/* Cleanup */
+	janus_mutex_lock(&ws_client->ts->mutex);
+	JANUS_LOG(LOG_INFO, "[%s-%p] Destroying WebSocket client\n", log_prefix, wsi);
+	ws_client->wsi = NULL;
 	/* Notify handlers about this transport being gone */
 	if(notify_events && gateway->events_is_enabled()) {
 		json_t *info = json_object();
 		json_object_set_new(info, "event", json_string("disconnected"));
-		gateway->notify_event(&janus_websockets_transport, ws_client, info);
+		gateway->notify_event(&janus_websockets_transport, ws_client->ts, info);
 	}
-	/* Notify core */
-	//TODO: Do not notify the core. If we do so, Core will close all webrtc connections. We need to pretend like client always connected.
-
-	gateway->transport_gone(&janus_websockets_transport, ws_client);
-	/* Mark the session as closed */
-	janus_mutex_lock(&old_wss_mutex);
-	old_wss = g_list_append(old_wss, ws_client);
-	janus_mutex_unlock(&old_wss_mutex);
-	/* Cleanup */
-	janus_mutex_lock(&ws_client->mutex);
-	JANUS_LOG(LOG_INFO, "[%s-%p] Destroying WebSocket client\n", log_prefix, wsi);
-	ws_client->destroy = 1;
-	ws_client->wsi = NULL;
+	ws_client->ts->transport_p = NULL;
 	/* Remove messages queue too, if needed */
 	if(ws_client->messages != NULL) {
 		char *response = NULL;
@@ -1403,7 +1473,10 @@ static void janus_websockets_destroy_client(
 	ws_client->buflen = 0;
 	ws_client->bufpending = 0;
 	ws_client->bufoffset = 0;
-	janus_mutex_unlock(&ws_client->mutex);
+	janus_mutex_unlock(&ws_client->ts->mutex);
+	/* Notify core */
+	gateway->transport_gone(&janus_websockets_transport, ws_client->ts);
+	janus_transport_session_destroy(ws_client->ts);
 }
 
 int janus_websockets_get_api_compatibility(void) {
@@ -1443,7 +1516,8 @@ gboolean janus_websockets_is_admin_api_enabled(void) {
 	return ws_admin_api_enabled;
 }
 
-int janus_websockets_send_message(void *transport, void *request_id, gboolean admin, json_t *message) {
+
+int janus_websockets_send_message(janus_transport_session *transport, void *request_id, gboolean admin, json_t *message) {
 	JANUS_LOG(LOG_INFO, "janus_websockets_send_message -> \n %s \n", json_dumps(message, json_format));
     if(message == NULL)
 		return -1;
@@ -1452,7 +1526,6 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
 	// 	return -1;
 	// }
 	// /* Make sure this is not related to a closed /freed WebSocket session */
-	// janus_mutex_lock(&old_wss_mutex);
 	// janus_websockets_client *client = (janus_websockets_client *)transport;
 	// if(g_list_find(old_wss, client) != NULL || !client->wsi) {
 	// 	json_decref(message);
@@ -1460,9 +1533,7 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
 	// 	transport = NULL;
     // 	return -1;
     // }
-	// janus_mutex_unlock(&old_wss_mutex);
 
-    //janus_mutex_lock(&tracer_webserver_ws_client->mutex);
 
     tracer_driver *driver = NULL;
     guint64 handle_id = 0;
@@ -1479,7 +1550,6 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
     {
         JANUS_LOG(LOG_INFO, "Janus is NULL. Returning.\n");
         json_decref(message);
-        janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
         return -1;
     }
     janus_text = json_string_value(j);
@@ -1494,21 +1564,18 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
         if (!plugindata)
         {
             json_decref(message);
-            janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
             return 0;
         }
         json_t *data = json_object_get(plugindata, "data");
         if (!data)
         {
             json_decref(message);
-            janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
             return 0;
         }
         json_t *streaming = json_object_get(data, "streaming");
         if (!streaming)
         {
             json_decref(message);
-            janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
             return 0;
         }
         const char *streaming_text = json_string_value(streaming);
@@ -1518,7 +1585,6 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
             json_t *channelMessage = json_object_get(data, "message");
             if (!channelMessage)
             {
-                janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
                 return 0;
             }
             //This is the pure message got from data channel. It may be ID of the driver or control command.
@@ -1550,7 +1616,6 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
             json_t *jsep = json_object_get(message, "jsep");
             if (!jsep)
             {
-                janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
                 return 0;
             }
             json_t *sdp = json_object_get(jsep, "sdp");
@@ -1576,7 +1641,6 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
         if (id == NULL)
         {
             JANUS_LOG(LOG_INFO, "Nothing interesting\n");
-            janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
             //Nothing interesting
             return 0;
         }
@@ -1592,7 +1656,6 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
             driver = tracer_find_driver((char *)transaction_text); //We gave driver id as transaction when attaching to the plugin.
             if (driver == NULL)
             {
-                janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
                 return -1;
             }
             int mountpoint_id = 1;
@@ -1619,7 +1682,6 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
 
 
                 json_decref(message);
-                janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
 
                 info = json_object();
                 json_object_set_new(info, "info", json_string("offerrequest"));
@@ -1645,12 +1707,10 @@ int janus_websockets_send_message(void *transport, void *request_id, gboolean ad
             // gateway->incoming_request(&janus_websockets_transport, tracer_webserver_ws_client, NULL, 0, request, NULL);
 
         
-            janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
 
 
             return 0;
         }
-        janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
         return 0;
     }
     else if (!strcasecmp(janus_text, "webrtcup"))
@@ -1734,27 +1794,22 @@ send_info:
 	}*/
 }
 
-void janus_websockets_session_created(void *transport, guint64 session_id)
+void janus_websockets_session_created(janus_transport_session *transport, guint64 session_id)
 {
     /* We don't care */
     JANUS_LOG(LOG_INFO, "We got our session ID : %" SCNu64 "\n", session_id);
     tracer_session_id = session_id;
 }
 
-void janus_websockets_session_over(void *transport, guint64 session_id, gboolean timeout) {
-	if(transport == NULL || !timeout)
-		return;
-	/* We only care if it's a timeout: if so, close the connection */
-	janus_websockets_client *client = (janus_websockets_client *)transport;
-	/* Make sure this is not related to a closed WebSocket session */
-	janus_mutex_lock(&old_wss_mutex);
-	if(g_list_find(old_wss, client) == NULL && client->wsi){
-		janus_mutex_lock(&client->mutex);
-		client->session_timeout = 1;
-		lws_callback_on_writable(client->wsi);
-		janus_mutex_unlock(&client->mutex);
-	}
-	janus_mutex_unlock(&old_wss_mutex);
+
+
+void janus_websockets_session_over(janus_transport_session *transport, guint64 session_id, gboolean timeout, gboolean claimed) {
+	/* We don't care either: transport timeouts can be detected using the ping/pong mechanism */
+}
+
+void janus_websockets_session_claimed(janus_transport_session *transport, guint64 session_id) {
+	/* We don't care about this. We should start receiving messages from the core about this session: no action necessary */
+	/* FIXME Is the above statement accurate? Should we care? Unlike the HTTP transport, there is no hashtable to update */
 }
 
 
@@ -2105,11 +2160,6 @@ static int janus_websockets_common_callback(
 				JANUS_LOG(LOG_ERR, "[%s-%p] Invalid WebSocket client instance...\n", log_prefix, wsi);
 				return -1;
 			}
-			/* Clean the old sessions list, in case this pointer was used before */
-			janus_mutex_lock(&old_wss_mutex);
-			if(g_list_find(old_wss, ws_client) != NULL)
-				old_wss = g_list_remove(old_wss, ws_client);
-			janus_mutex_unlock(&old_wss_mutex);
 			/* Prepare the session */
 			ws_client->wsi = wsi;
 			ws_client->messages = g_async_queue_new();
@@ -2117,9 +2167,8 @@ static int janus_websockets_common_callback(
 			ws_client->buflen = 0;
 			ws_client->bufpending = 0;
 			ws_client->bufoffset = 0;
-			ws_client->session_timeout = 0;
-			ws_client->destroy = 0;
-			janus_mutex_init(&ws_client->mutex);
+			g_atomic_int_set(&ws_client->destroyed, 0);
+			ws_client->ts = janus_transport_session_create(ws_client, NULL);
 
             //TODO: Her baglanti geldiginde atama yapmak yerine, mesaj geldiginde dogru sifreyle gelirse atama yap.
             tracer_webserver_ws_client = ws_client;
@@ -2141,29 +2190,27 @@ static int janus_websockets_common_callback(
 				json_object_set_new(info, "event", json_string("connected"));
 				json_object_set_new(info, "admin_api", admin ? json_true() : json_false());
 				json_object_set_new(info, "ip", json_string(ip));
-				gateway->notify_event(&janus_websockets_transport, ws_client, info);
+				gateway->notify_event(&janus_websockets_transport, ws_client->ts, info);
 			}
 			return 0;
 		}
 		case LWS_CALLBACK_RECEIVE: {
 			JANUS_LOG(LOG_HUGE, "[%s-%p] Got %zu bytes:\n", log_prefix, wsi, len);
-			if (ws_client == NULL || ws_client->wsi == NULL)
-			{
+			if(ws_client == NULL || ws_client->wsi == NULL) {
 				JANUS_LOG(LOG_ERR, "[%s-%p] Invalid WebSocket client instance...\n", log_prefix, wsi);
 				return -1;
 			}
+			if(g_atomic_int_get(&ws_client->destroyed))
+				return 0;
 			/* Is this a new message, or part of a fragmented one? */
 			const size_t remaining = lws_remaining_packet_payload(wsi);
-			if (ws_client->incoming == NULL)
-			{
+			if(ws_client->incoming == NULL) {
 				JANUS_LOG(LOG_HUGE, "[%s-%p] First fragment: %zu bytes, %zu remaining\n", log_prefix, wsi, len, remaining);
-				ws_client->incoming = g_malloc(len + 1);
+				ws_client->incoming = g_malloc(len+1);
 				memcpy(ws_client->incoming, in, len);
 				ws_client->incoming[len] = '\0';
 				JANUS_LOG(LOG_HUGE, "%s\n", ws_client->incoming);
-			}
-			else
-			{
+			} else {
 				size_t offset = strlen(ws_client->incoming);
 				JANUS_LOG(LOG_HUGE, "[%s-%p] Appending fragment: offset %zu, %zu bytes, %zu remaining\n", log_prefix, wsi, offset, len, remaining);
 				ws_client->incoming = g_realloc(ws_client->incoming, offset+len+1);
@@ -2171,8 +2218,8 @@ static int janus_websockets_common_callback(
 				ws_client->incoming[offset+len] = '\0';
 				JANUS_LOG(LOG_HUGE, "%s\n", ws_client->incoming+offset);
 			}
-			if(remaining > 0) // || !lws_is_final_fragment(wsi))
-			{
+			//TODO: Comment !lws_is_final_fragment(wsi) part if it is not working.
+			if(remaining > 0 || !lws_is_final_fragment(wsi)) {
 				/* Still waiting for some more fragments */
 				JANUS_LOG(LOG_HUGE, "[%s-%p] Waiting for more fragments\n", log_prefix, wsi);
 				return 0;
@@ -2440,15 +2487,11 @@ static int janus_websockets_common_callback(
                 json_object_set_new(info, "info", json_string("webrtcup"));
                 json_object_set_new(info, "driverid", json_string(driver->id));
 
-                janus_mutex_lock(&tracer_webserver_ws_client->mutex);
-                janus_mutex_lock(&old_wss_mutex);
                 //Send info to web server
                 /* Convert to string and enqueue */
                 char *payload = json_dumps(info, json_format);
                 g_async_queue_push(tracer_webserver_ws_client->messages, payload);
                 lws_callback_on_writable(tracer_webserver_ws_client->wsi);
-                janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
-                janus_mutex_unlock(&old_wss_mutex);
                 json_decref(info);
                 json_decref(message);
                 return 0;
@@ -2605,15 +2648,11 @@ static int janus_websockets_common_callback(
                 json_object_set_new(info, "info", json_string("webrtcup"));
                 json_object_set_new(info, "driverid", json_string(driver->id));
 
-                janus_mutex_lock(&tracer_webserver_ws_client->mutex);
-                janus_mutex_lock(&old_wss_mutex);
                 //Send info to web server
                 /* Convert to string and enqueue */
                 char *payload = json_dumps(info, json_format);
                 g_async_queue_push(tracer_webserver_ws_client->messages, payload);
                 lws_callback_on_writable(tracer_webserver_ws_client->wsi);
-                janus_mutex_unlock(&tracer_webserver_ws_client->mutex);
-                janus_mutex_unlock(&old_wss_mutex);
                 json_decref(info);
                 json_decref(message);
                 return 0;
@@ -3101,17 +3140,16 @@ static int janus_websockets_common_callback(
         //controlcar: includes carId, speed and steering values.
 
         return 0;
-    }
-		case LWS_CALLBACK_SERVER_WRITEABLE: {
+    }case LWS_CALLBACK_SERVER_WRITEABLE: {
 			if(ws_client == NULL || ws_client->wsi == NULL) {
 				JANUS_LOG(LOG_ERR, "[%s-%p] Invalid WebSocket client instance...\n", log_prefix, wsi);
 				return -1;
 			}
-			if(!ws_client->destroy && !g_atomic_int_get(&stopping)) {
-				janus_mutex_lock(&ws_client->mutex);
+			if(!g_atomic_int_get(&ws_client->destroyed) && !g_atomic_int_get(&stopping)) {
+				janus_mutex_lock(&ws_client->ts->mutex);
 				/* Check if we have a pending/partial write to complete first */
 				if(ws_client->buffer && ws_client->bufpending > 0 && ws_client->bufoffset > 0
-						&& !ws_client->destroy && !g_atomic_int_get(&stopping)) {
+						&& !g_atomic_int_get(&ws_client->destroyed) && !g_atomic_int_get(&stopping)) {
 					JANUS_LOG(LOG_HUGE, "[%s-%p] Completing pending WebSocket write (still need to write last %d bytes)...\n",
 						log_prefix, wsi, ws_client->bufpending);
 					int sent = lws_write(wsi, ws_client->buffer + ws_client->bufoffset, ws_client->bufpending, LWS_WRITE_TEXT);
@@ -3127,12 +3165,12 @@ static int janus_websockets_common_callback(
 					}
 					/* Done for this round, check the next response/notification later */
 					lws_callback_on_writable(wsi);
-					janus_mutex_unlock(&ws_client->mutex);
+					janus_mutex_unlock(&ws_client->ts->mutex);
 					return 0;
 				}
 				/* Shoot all the pending messages */
 				char *response = g_async_queue_try_pop(ws_client->messages);
-				if(response && !ws_client->destroy && !g_atomic_int_get(&stopping)) {
+				if(response && !g_atomic_int_get(&ws_client->destroyed) && !g_atomic_int_get(&stopping)) {
 					/* Gotcha! */
 					int buflen = LWS_SEND_BUFFER_PRE_PADDING + strlen(response) + LWS_SEND_BUFFER_POST_PADDING;
 					if (buflen > ws_client->buflen) {
@@ -3156,10 +3194,10 @@ static int janus_websockets_common_callback(
 					free(response);
 					/* Done for this round, check the next response/notification later */
 					lws_callback_on_writable(wsi);
-					janus_mutex_unlock(&ws_client->mutex);
+					janus_mutex_unlock(&ws_client->ts->mutex);
 					return 0;
 				}
-				janus_mutex_unlock(&ws_client->mutex);
+				janus_mutex_unlock(&ws_client->ts->mutex);
 			}
 			return 0;
 		}

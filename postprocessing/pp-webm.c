@@ -174,6 +174,7 @@ int janus_pp_webm_preprocess(FILE *file, janus_pp_frame_packet *list, int vp8) {
 		return -1;
 	janus_pp_frame_packet *tmp = list;
 	int bytes = 0, min_ts_diff = 0, max_ts_diff = 0;
+	int rotation = -1;
 	char prebuffer[1500];
 	memset(prebuffer, 0, 1500);
 	while(tmp) {
@@ -196,13 +197,20 @@ int janus_pp_webm_preprocess(FILE *file, janus_pp_frame_packet *list, int vp8) {
 			tmp = tmp->next;
 			continue;
 		}
+		if(tmp->rotation != -1 && tmp->rotation != rotation) {
+			rotation = tmp->rotation;
+			JANUS_LOG(LOG_INFO, "Video rotation: %d degrees\n", rotation);
+		}
 		if(vp8) {
 			/* https://tools.ietf.org/html/draft-ietf-payload-vp8 */
 			/* Read the first bytes of the payload, and get the first octet (VP8 Payload Descriptor) */
 			fseek(file, tmp->offset+12+tmp->skip, SEEK_SET);
 			bytes = fread(prebuffer, sizeof(char), 16, file);
-			if(bytes != 16)
+			if(bytes != 16) {
 				JANUS_LOG(LOG_WARN, "Didn't manage to read all the bytes we needed (%d < 16)...\n", bytes);
+				tmp = tmp->next;
+				continue;
+			}
 			char *buffer = (char *)&prebuffer;
 			uint8_t vp8pd = *buffer;
 			uint8_t xbit = (vp8pd & 0x80);
@@ -269,8 +277,11 @@ int janus_pp_webm_preprocess(FILE *file, janus_pp_frame_packet *list, int vp8) {
 			/* Read the first bytes of the payload, and get the first octet (VP9 Payload Descriptor) */
 			fseek(file, tmp->offset+12+tmp->skip, SEEK_SET);
 			bytes = fread(prebuffer, sizeof(char), 16, file);
-			if(bytes != 16)
+			if(bytes != 16) {
 				JANUS_LOG(LOG_WARN, "Didn't manage to read all the bytes we needed (%d < 16)...\n", bytes);
+				tmp = tmp->next;
+				continue;
+			}
 			char *buffer = (char *)&prebuffer;
 			uint8_t vp9pd = *buffer;
 			uint8_t ibit = (vp9pd & 0x80);
@@ -363,7 +374,7 @@ int janus_pp_webm_process(FILE *file, janus_pp_frame_packet *list, int vp8, int 
 	uint8_t *buffer = g_malloc0(10000), *start = buffer;
 	int len = 0, frameLen = 0;
 	int keyFrame = 0;
-	uint32_t keyframe_ts = 0;
+	gboolean keyframe_found = FALSE;
 
 	while(*working && tmp != NULL) {
 		keyFrame = 0;
@@ -381,9 +392,16 @@ int janus_pp_webm_process(FILE *file, janus_pp_frame_packet *list, int vp8, int 
 			buffer = start;
 			fseek(file, tmp->offset+12+tmp->skip, SEEK_SET);
 			len = tmp->len-12-tmp->skip;
+			if(len < 1) {
+				tmp = tmp->next;
+				continue;
+			}
 			bytes = fread(buffer, sizeof(char), len, file);
-			if(bytes != len)
+			if(bytes != len) {
 				JANUS_LOG(LOG_WARN, "Didn't manage to read all the bytes we needed (%d < %d)...\n", bytes, len);
+				tmp = tmp->next;
+				continue;
+			}
 			if(vp8) {
 				/* VP8 depay */
 					/* https://tools.ietf.org/html/draft-ietf-payload-vp8 */
@@ -456,8 +474,8 @@ int janus_pp_webm_process(FILE *file, janus_pp_frame_packet *list, int vp8, int 
 							int vp8hs = swap2(*(unsigned short*)(c+5))>>14;
 							JANUS_LOG(LOG_VERB, "(seq=%"SCNu16", ts=%"SCNu64") Key frame: %dx%d (scale=%dx%d)\n", tmp->seq, tmp->ts, vp8w, vp8h, vp8ws, vp8hs);
 							/* Is this the first keyframe we find? */
-							if(keyframe_ts == 0) {
-								keyframe_ts = tmp->ts;
+							if(!keyframe_found) {
+								keyframe_found = TRUE;
 								JANUS_LOG(LOG_INFO, "First keyframe: %"SCNu64"\n", tmp->ts-list->ts);
 							}
 						}
@@ -540,8 +558,8 @@ int janus_pp_webm_process(FILE *file, janus_pp_frame_packet *list, int vp8, int 
 						}
 						/* Is this the first keyframe we find?
 						 * (FIXME assuming this really means "keyframe...) */
-						if(keyframe_ts == 0) {
-							keyframe_ts = tmp->ts;
+						if(!keyframe_found) {
+							keyframe_found = TRUE;
 							JANUS_LOG(LOG_INFO, "First keyframe: %"SCNu64"\n", tmp->ts-list->ts);
 						}
 					}
