@@ -3612,12 +3612,15 @@ static void *janus_streaming_handler(void *data)
 			g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
 
 #ifdef HAVE_SCTP
-			/* Add data line */
-			g_snprintf(buffer, 512,
-					   "m=application 1 DTLS/SCTP 5000\r\n"
-					   "c=IN IP4 1.1.1.1\r\n"
-					   "a=sctpmap:5000 webrtc-datachannel 16\r\n");
-			g_strlcat(sdptemp, buffer, 2048);
+			json_t *dataChannel = json_object_get(root, "datachannel");
+			if(dataChannel){
+				/* Add data line */
+				g_snprintf(buffer, 512,
+						"m=application 1 DTLS/SCTP 5000\r\n"
+						"c=IN IP4 1.1.1.1\r\n"
+						"a=sctpmap:5000 webrtc-datachannel 16\r\n");
+				g_strlcat(sdptemp, buffer, 2048);
+			}
 #endif
 			janus_mutex_unlock(&mountpoints_mutex);
 			sdp = g_strdup(sdptemp);

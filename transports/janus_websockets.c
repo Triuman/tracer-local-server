@@ -3023,6 +3023,7 @@ static int janus_websockets_common_callback(
                 json_object_set_new(message, "handle_id", json_integer(driver->handle_id_left));
                 json_t *body = json_object();
                 json_object_set_new(body, "request", json_string("acceptoffer"));
+                json_object_set_new(body, "datachannel", json_true());
                 json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
                 json_object_set_new(message, "body", body);
                 json_object_set_new(message, "jsep", offersdp);
@@ -3034,7 +3035,7 @@ static int janus_websockets_common_callback(
                 json_object_set_new(message, "handle_id", json_integer(driver->handle_id_right));
                 json_t *body = json_object();
                 json_object_set_new(body, "request", json_string("acceptoffer"));
-                json_object_set_new(body, "id", json_integer(1)); //Just to get some info about tracer_mountpoint_list to create SDP.
+                json_object_set_new(body, "id", json_integer(2)); //Just to get some info about tracer_mountpoint_list to create SDP.
                 json_object_set_new(message, "body", body);
                 json_object_set_new(message, "jsep", offersdp);
             }
