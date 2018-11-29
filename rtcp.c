@@ -137,7 +137,8 @@ static void janus_rtcp_incoming_sr(janus_rtcp_context *ctx, janus_rtcp_sr *sr) {
 #define LINK_QUALITY_FILTER_K 3.0
 
 static double janus_rtcp_link_quality_filter(double last, double in) {
-	if (last == 0 || last != last) {
+	/* Note: the last!=last is there to check for NaN */
+	if(last == 0 || last == in || last != last) {
 		return in;
 	} else {
 		return (1.0 - 1.0/LINK_QUALITY_FILTER_K) * last + (1.0/LINK_QUALITY_FILTER_K) * in;
@@ -502,7 +503,7 @@ char *janus_rtcp_filter(char *packet, int len, int *newlen) {
 }
 
 
-int janus_rtcp_process_incoming_rtp(janus_rtcp_context *ctx, char *packet, int len) {
+int janus_rtcp_process_incoming_rtp(janus_rtcp_context *ctx, char *packet, int len, gboolean count_lost) {
 	if(ctx == NULL || packet == NULL || len < 1)
 		return -1;
 
@@ -516,7 +517,6 @@ int janus_rtcp_process_incoming_rtp(janus_rtcp_context *ctx, char *packet, int l
 	if(ctx->base_seq == 0 && ctx->seq_cycle == 0)
 		ctx->base_seq = seq_number;
 
-	ctx->received++;
 	if((int16_t)(seq_number - ctx->max_seq_nr) < 0) {
 		/* Late packet or retransmission */
 		ctx->retransmitted++;
@@ -524,6 +524,7 @@ int janus_rtcp_process_incoming_rtp(janus_rtcp_context *ctx, char *packet, int l
 		if(seq_number < ctx->max_seq_nr)
 			ctx->seq_cycle++;
 		ctx->max_seq_nr = seq_number;
+		ctx->received++;
 	}
 	uint32_t rtp_expected = 0x0;
 	if(ctx->seq_cycle > 0) {
@@ -531,7 +532,8 @@ int janus_rtcp_process_incoming_rtp(janus_rtcp_context *ctx, char *packet, int l
 		rtp_expected = rtp_expected << 16;
 	}
 	rtp_expected = rtp_expected + 1 + ctx->max_seq_nr - ctx->base_seq;
-	ctx->lost = rtp_expected - ctx->received;
+	if(count_lost && rtp_expected >= ctx->received)
+		ctx->lost = rtp_expected - ctx->received;
 	ctx->expected = rtp_expected;
 
 	uint64_t arrival = (janus_get_monotonic_time() * ctx->tb) / 1000000;
@@ -689,6 +691,68 @@ gboolean janus_rtcp_parse_lost_info(char *packet, int len, uint32_t *lost, int *
 		rtcp = (janus_rtcp_header *)((uint32_t*)rtcp + length + 1);
 	}
 	return FALSE;
+}
+
+int janus_rtcp_fix_report_data(char *packet, int len, uint32_t base_ts, uint32_t base_ts_prev, uint32_t ssrc_peer, uint32_t ssrc_local, uint32_t ssrc_expected, gboolean video) {
+	if(packet == NULL || len <= 0)
+		return -1;
+	/* Parse RTCP compound packet */
+	janus_rtcp_header *rtcp = (janus_rtcp_header *)packet;
+	if(rtcp->version != 2)
+		return -2;
+	int pno = 0, total = len, status = 0;
+	while(rtcp) {
+		pno++;
+		switch(rtcp->type) {
+			case RTCP_RR: {
+				janus_rtcp_rr *rr = (janus_rtcp_rr *)rtcp;
+				rr->ssrc = htonl(ssrc_peer);
+				status++;
+				if (rr->header.rc > 0) {
+					rr->rb[0].ssrc = htonl(ssrc_local);
+					status++;
+					/* FIXME we need to fix the extended highest sequence number received */
+					/* FIXME we need to fix the cumulative number of packets lost */
+					break;
+				}
+				break;
+			}
+			case RTCP_SR: {
+				janus_rtcp_sr *sr = (janus_rtcp_sr *)rtcp;
+				uint32_t recv_ssrc = ntohl(sr->ssrc);
+				if (recv_ssrc != ssrc_expected) {
+					JANUS_LOG(LOG_WARN,"Incoming RTCP SR SSRC (%"SCNu32") does not match the expected one (%"SCNu32") video=%d\n", recv_ssrc, ssrc_expected, video);
+					return -3;
+				}
+				sr->ssrc = htonl(ssrc_peer);
+				/* FIXME we need to fix the sender's packet count */
+				/* FIXME we need to fix the sender's octet count */
+				uint32_t sr_ts = ntohl(sr->si.rtp_ts);
+				uint32_t fix_ts = (sr_ts - base_ts) + base_ts_prev;
+				sr->si.rtp_ts = htonl(fix_ts);
+				status++;
+				if (sr->header.rc > 0) {
+					sr->rb[0].ssrc = htonl(ssrc_local);
+					status++;
+					/* FIXME we need to fix the extended highest sequence number received */
+					/* FIXME we need to fix the cumulative number of packets lost */
+					break;
+				}
+				break;
+			}
+			default:
+				break;
+		}
+		/* Is this a compound packet? */
+		int length = ntohs(rtcp->length);
+		if(length == 0)
+			break;
+		total -= length*4+4;
+		if(total <= 0)
+			break;
+		rtcp = (janus_rtcp_header *)((uint32_t*)rtcp + length + 1);
+	}
+	return status;
 }
 
 gboolean janus_rtcp_has_bye(char *packet, int len) {

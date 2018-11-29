@@ -15,7 +15,7 @@
  * to make sure they are coherent with the involved SSRCs. In order to
  * demonstrate how peer-provided messages can change the behaviour of a
  * plugin, this plugin implements a simple API based on three messages:
- * 
+ *
  * 1. a message to enable/disable audio (that is, to tell the plugin
  * whether incoming audio RTP packets need to be sent back or discarded);
  * 2. a message to enable/disable video (that is, to tell the plugin
@@ -23,13 +23,13 @@
  * 3. a message to cap the bitrate (which would modify incoming RTCP
  * REMB messages before sending them back, in order to trick the peer into
  * thinking the available bandwidth is different).
- * 
+ *
  * \section echoapi Echo Test API
- * 
+ *
  * There's a single unnamed request you can send and it's asynchronous,
  * which means all responses (successes and errors) will be delivered
- * as events with the same transaction. 
- * 
+ * as events with the same transaction.
+ *
  * The request has to be formatted as follows. All the attributes are
  * optional, so any request can contain a subset of them:
  *
@@ -63,7 +63,7 @@
  * are automatically appended); finally, in case the session uses
  * simulcasting, \c substream and \c temporal can be used to manually
  * pick which substream and/or temporal layer should be received back.
- * 
+ *
  * A JSEP offer can be sent along any request to negotiate a PeerConnection:
  * in that case, a JSEP answer will be provided with the asynchronous
  * response notification. Other requests (e.g., to dynamically manipulate
@@ -71,19 +71,19 @@
  * attached, unless you want to renegotiate a session (e.g., to add/remove
  * a media stream, or force an ICE restart): in case of renegotiations,
  * the same rules as the first JSEP offer apply.
- * 
+ *
  * A successful request will result in an \c ok event:
- * 
+ *
 \verbatim
 {
 	"echotest" : "event",
 	"result": "ok"
 }
 \endverbatim
- * 
+ *
  * An error instead will provide both an error code and a more verbose
  * description of the cause of the issue:
- * 
+ *
 \verbatim
 {
 	"echotest" : "event",
@@ -95,7 +95,7 @@
  * If the plugin detects a loss of the associated PeerConnection, a
  * "done" notification is triggered to inform the application the Echo
  * Test session is over:
- * 
+ *
 \verbatim
 {
 	"echotest" : "event",
@@ -162,7 +162,7 @@ static janus_plugin janus_echotest_plugin =
 		.get_name = janus_echotest_get_name,
 		.get_author = janus_echotest_get_author,
 		.get_package = janus_echotest_get_package,
-		
+
 		.create_session = janus_echotest_create_session,
 		.handle_message = janus_echotest_handle_message,
 		.setup_media = janus_echotest_setup_media,
@@ -283,12 +283,19 @@ int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
 
 	/* Read configuration */
 	char filename[255];
-	g_snprintf(filename, 255, "%s/%s.cfg", config_path, JANUS_ECHOTEST_PACKAGE);
+	g_snprintf(filename, 255, "%s/%s.jcfg", config_path, JANUS_ECHOTEST_PACKAGE);
 	JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
 	janus_config *config = janus_config_parse(filename);
+	if(config == NULL) {
+		JANUS_LOG(LOG_WARN, "Couldn't find .jcfg configuration file (%s), trying .cfg\n", JANUS_ECHOTEST_PACKAGE);
+		g_snprintf(filename, 255, "%s/%s.cfg", config_path, JANUS_ECHOTEST_PACKAGE);
+		JANUS_LOG(LOG_VERB, "Configuration file: %s\n", filename);
+		config = janus_config_parse(filename);
+	}
 	if(config != NULL) {
 		janus_config_print(config);
-		janus_config_item *events = janus_config_get_item_drilldown(config, "general", "events");
+		janus_config_category *config_general = janus_config_get_create(config, NULL, janus_config_type_category, "general");
+		janus_config_item *events = janus_config_get(config, config_general, janus_config_type_item, "events");
 		if(events != NULL && events->value != NULL)
 			notify_events = janus_is_true(events->value);
 		if(!notify_events && callback->events_is_enabled()) {
@@ -297,7 +304,7 @@ int janus_echotest_init(janus_callbacks *callback, const char *config_path) {
 	}
 	janus_config_destroy(config);
 	config = NULL;
-	
+
 	sessions = g_hash_table_new_full(NULL, NULL, NULL, (GDestroyNotify)janus_echotest_session_destroy);
 	messages = g_async_queue_new_full((GDestroyNotify) janus_echotest_message_free);
 	/* This is the callback we'll need to invoke to contact the server */
@@ -330,10 +337,10 @@ void janus_echotest_destroy(void) {
 	/* FIXME We should destroy the sessions cleanly */
 	janus_mutex_lock(&sessions_mutex);
 	g_hash_table_destroy(sessions);
+	sessions = NULL;
 	janus_mutex_unlock(&sessions_mutex);
 	g_async_queue_unref(messages);
 	messages = NULL;
-	sessions = NULL;
 
 	g_atomic_int_set(&initialized, 0);
 	g_atomic_int_set(&stopping, 0);
@@ -381,7 +388,7 @@ void janus_echotest_create_session(janus_plugin_session *handle, int *error) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
 		*error = -1;
 		return;
-	}	
+	}
 	janus_echotest_session *session = g_malloc0(sizeof(janus_echotest_session));
 	session->handle = handle;
 	session->has_audio = FALSE;
@@ -411,7 +418,7 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
 		*error = -1;
 		return;
-	}	
+	}
 	janus_mutex_lock(&sessions_mutex);
 	janus_echotest_session *session = janus_echotest_lookup_session(handle);
 	if(!session) {
@@ -430,7 +437,7 @@ void janus_echotest_destroy_session(janus_plugin_session *handle, int *error) {
 json_t *janus_echotest_query_session(janus_plugin_session *handle) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized)) {
 		return NULL;
-	}	
+	}
 	janus_mutex_lock(&sessions_mutex);
 	janus_echotest_session *session = janus_echotest_lookup_session(handle);
 	if(!session) {
@@ -522,7 +529,7 @@ void janus_echotest_incoming_rtp(janus_plugin_session *handle, int video, char *
 	/* Simple echo test */
 	if(gateway) {
 		/* Honour the audio/video active flags */
-		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
+		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 		if(!session) {
 			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 			return;
@@ -612,7 +619,7 @@ void janus_echotest_incoming_rtcp(janus_plugin_session *handle, int video, char 
 		return;
 	/* Simple echo test */
 	if(gateway) {
-		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
+		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 		if(!session) {
 			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 			return;
@@ -646,7 +653,7 @@ void janus_echotest_incoming_data(janus_plugin_session *handle, char *buf, int l
 		return;
 	/* Simple echo test */
 	if(gateway) {
-		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;	
+		janus_echotest_session *session = (janus_echotest_session *)handle->plugin_handle;
 		if(!session) {
 			JANUS_LOG(LOG_ERR, "No session associated with this handle...\n");
 			return;
@@ -978,93 +985,7 @@ static void *janus_echotest_handler(void *data) {
 				gateway->relay_rtcp(session->handle, 1, buf, 12);
 			}
 		}
-		if(record) {
-			if(msg_sdp) {
-				session->has_audio = (strstr(msg_sdp, "m=audio") != NULL);
-				session->has_video = (strstr(msg_sdp, "m=video") != NULL);
-				session->has_data = (strstr(msg_sdp, "DTLS/SCTP") != NULL);
-			}
-			gboolean recording = json_is_true(record);
-			const char *recording_base = json_string_value(recfile);
-			JANUS_LOG(LOG_VERB, "Recording %s (base filename: %s)\n", recording ? "enabled" : "disabled", recording_base ? recording_base : "not provided");
-			janus_mutex_lock(&session->rec_mutex);
-			if(!recording) {
-				janus_echotest_recorder_close(session);
-			} else {
-				/* We've started recording, send a PLI and go on */
-				char filename[255];
-				gint64 now = janus_get_real_time();
-				if(session->has_audio) {
-					/* FIXME We assume we're recording Opus, here */
-					memset(filename, 0, 255);
-					if(recording_base) {
-						/* Use the filename and path we have been provided */
-						g_snprintf(filename, 255, "%s-audio", recording_base);
-						session->arc = janus_recorder_create(NULL, janus_audiocodec_name(session->acodec), filename);
-						if(session->arc == NULL) {
-							/* FIXME We should notify the fact the recorder could not be created */
-							JANUS_LOG(LOG_ERR, "Couldn't open an audio recording file for this EchoTest user!\n");
-						}
-					} else {
-						/* Build a filename */
-						g_snprintf(filename, 255, "echotest-%p-%"SCNi64"-audio", session, now);
-						session->arc = janus_recorder_create(NULL, janus_audiocodec_name(session->acodec), filename);
-						if(session->arc == NULL) {
-							/* FIXME We should notify the fact the recorder could not be created */
-							JANUS_LOG(LOG_ERR, "Couldn't open an audio recording file for this EchoTest user!\n");
-						}
-					}
-				}
-				if(session->has_video) {
-					/* FIXME We assume we're recording VP8, here */
-					memset(filename, 0, 255);
-					if(recording_base) {
-						/* Use the filename and path we have been provided */
-						g_snprintf(filename, 255, "%s-video", recording_base);
-						session->vrc = janus_recorder_create(NULL, janus_videocodec_name(session->vcodec), filename);
-						if(session->vrc == NULL) {
-							/* FIXME We should notify the fact the recorder could not be created */
-							JANUS_LOG(LOG_ERR, "Couldn't open an video recording file for this EchoTest user!\n");
-						}
-					} else {
-						/* Build a filename */
-						g_snprintf(filename, 255, "echotest-%p-%"SCNi64"-video", session, now);
-						session->vrc = janus_recorder_create(NULL, janus_videocodec_name(session->vcodec), filename);
-						if(session->vrc == NULL) {
-							/* FIXME We should notify the fact the recorder could not be created */
-							JANUS_LOG(LOG_ERR, "Couldn't open an video recording file for this EchoTest user!\n");
-						}
-					}
-					/* Send a PLI */
-					JANUS_LOG(LOG_VERB, "Recording video, sending a PLI to kickstart it\n");
-					char buf[12];
-					memset(buf, 0, 12);
-					janus_rtcp_pli((char *)&buf, 12);
-					gateway->relay_rtcp(session->handle, 1, buf, 12);
-				}
-				if(session->has_data) {
-					memset(filename, 0, 255);
-					if(recording_base) {
-						/* Use the filename and path we have been provided */
-						g_snprintf(filename, 255, "%s-data", recording_base);
-						session->drc = janus_recorder_create(NULL, "text", filename);
-						if(session->drc == NULL) {
-							/* FIXME We should notify the fact the recorder could not be created */
-							JANUS_LOG(LOG_ERR, "Couldn't open a text data recording file for this EchoTest user!\n");
-						}
-					} else {
-						/* Build a filename */
-						g_snprintf(filename, 255, "echotest-%p-%"SCNi64"-data", session, now);
-						session->drc = janus_recorder_create(NULL, "text", filename);
-						if(session->drc == NULL) {
-							/* FIXME We should notify the fact the recorder could not be created */
-							JANUS_LOG(LOG_ERR, "Couldn't open a text data recording file for this EchoTest user!\n");
-						}
-					}
-				}
-			}
-			janus_mutex_unlock(&session->rec_mutex);
-		}
+
 		/* Any SDP to handle? */
 		if(msg_sdp) {
 			JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well:\n%s\n", msg_sdp_type, msg_sdp);
@@ -1186,6 +1107,88 @@ static void *janus_echotest_handler(void *data) {
 			json_decref(event);
 			json_decref(jsep);
 		}
+		if(record) {
+			gboolean recording = json_is_true(record);
+			const char *recording_base = json_string_value(recfile);
+			JANUS_LOG(LOG_VERB, "Recording %s (base filename: %s)\n", recording ? "enabled" : "disabled", recording_base ? recording_base : "not provided");
+			janus_mutex_lock(&session->rec_mutex);
+			if(!recording) {
+				janus_echotest_recorder_close(session);
+			} else {
+				/* We've started recording, send a PLI and go on */
+				char filename[255];
+				gint64 now = janus_get_real_time();
+				if(session->has_audio) {
+					/* FIXME We assume we're recording Opus, here */
+					memset(filename, 0, 255);
+					if(recording_base) {
+						/* Use the filename and path we have been provided */
+						g_snprintf(filename, 255, "%s-audio", recording_base);
+						session->arc = janus_recorder_create(NULL, janus_audiocodec_name(session->acodec), filename);
+						if(session->arc == NULL) {
+							/* FIXME We should notify the fact the recorder could not be created */
+							JANUS_LOG(LOG_ERR, "Couldn't open an audio recording file for this EchoTest user!\n");
+						}
+					} else {
+						/* Build a filename */
+						g_snprintf(filename, 255, "echotest-%p-%"SCNi64"-audio", session, now);
+						session->arc = janus_recorder_create(NULL, janus_audiocodec_name(session->acodec), filename);
+						if(session->arc == NULL) {
+							/* FIXME We should notify the fact the recorder could not be created */
+							JANUS_LOG(LOG_ERR, "Couldn't open an audio recording file for this EchoTest user!\n");
+						}
+					}
+				}
+				if(session->has_video) {
+					/* FIXME We assume we're recording VP8, here */
+					memset(filename, 0, 255);
+					if(recording_base) {
+						/* Use the filename and path we have been provided */
+						g_snprintf(filename, 255, "%s-video", recording_base);
+						session->vrc = janus_recorder_create(NULL, janus_videocodec_name(session->vcodec), filename);
+						if(session->vrc == NULL) {
+							/* FIXME We should notify the fact the recorder could not be created */
+							JANUS_LOG(LOG_ERR, "Couldn't open an video recording file for this EchoTest user!\n");
+						}
+					} else {
+						/* Build a filename */
+						g_snprintf(filename, 255, "echotest-%p-%"SCNi64"-video", session, now);
+						session->vrc = janus_recorder_create(NULL, janus_videocodec_name(session->vcodec), filename);
+						if(session->vrc == NULL) {
+							/* FIXME We should notify the fact the recorder could not be created */
+							JANUS_LOG(LOG_ERR, "Couldn't open an video recording file for this EchoTest user!\n");
+						}
+					}
+					/* Send a PLI */
+					JANUS_LOG(LOG_VERB, "Recording video, sending a PLI to kickstart it\n");
+					char buf[12];
+					memset(buf, 0, 12);
+					janus_rtcp_pli((char *)&buf, 12);
+					gateway->relay_rtcp(session->handle, 1, buf, 12);
+				}
+				if(session->has_data) {
+					memset(filename, 0, 255);
+					if(recording_base) {
+						/* Use the filename and path we have been provided */
+						g_snprintf(filename, 255, "%s-data", recording_base);
+						session->drc = janus_recorder_create(NULL, "text", filename);
+						if(session->drc == NULL) {
+							/* FIXME We should notify the fact the recorder could not be created */
+							JANUS_LOG(LOG_ERR, "Couldn't open a text data recording file for this EchoTest user!\n");
+						}
+					} else {
+						/* Build a filename */
+						g_snprintf(filename, 255, "echotest-%p-%"SCNi64"-data", session, now);
+						session->drc = janus_recorder_create(NULL, "text", filename);
+						if(session->drc == NULL) {
+							/* FIXME We should notify the fact the recorder could not be created */
+							JANUS_LOG(LOG_ERR, "Couldn't open a text data recording file for this EchoTest user!\n");
+						}
+					}
+				}
+			}
+			janus_mutex_unlock(&session->rec_mutex);
+		}
 		janus_echotest_message_free(msg);
 
 		if(notify_events && gateway->events_is_enabled()) {
@@ -1218,7 +1221,7 @@ static void *janus_echotest_handler(void *data) {
 
 		/* Done, on to the next request */
 		continue;
-		
+
 error:
 		{
 			/* Prepare JSON error event */
